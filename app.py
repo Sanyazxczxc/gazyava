@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from den import ai
+from den import ai, alerts
 from den import indicators as ind
 from den.analysis import analyze, multi_timeframe
 from den.backtest import BYBIT_TAKER_FEE, BTConfig, describe, simulate
@@ -68,6 +68,30 @@ with st.sidebar:
         ai_model = st.text_input("Модель", value=ai.model_name(),
                                  help="openrouter/free выбирает доступную бесплатную модель. Можно указать "
                                       "конкретную, например с суффиксом :free, или платную.")
+    with st.expander("Уведомления в Telegram"):
+        if not os.environ.get("DEN_TG_TOKEN"):
+            tg_token = st.text_input("Токен бота", type="password", help="Создайте бота у @BotFather.")
+            if tg_token:
+                os.environ["DEN_TG_TOKEN"] = tg_token.strip()
+        if not os.environ.get("DEN_TG_CHAT"):
+            tg_chat = st.text_input("Chat id", help="Напишите боту любое сообщение и нажмите «Найти chat id».")
+            if tg_chat:
+                os.environ["DEN_TG_CHAT"] = tg_chat.strip()
+        t1, t2 = st.columns(2)
+        if t1.button("Найти chat id", disabled=not os.environ.get("DEN_TG_TOKEN")):
+            try:
+                ids = alerts.chat_ids()
+                st.write("\n".join(f"`{cid}` {who}" for cid, who in ids) or "Боту ещё никто не писал.")
+            except alerts.TelegramError as e:
+                st.error(str(e))
+        if t2.button("Тест", disabled=not (os.environ.get("DEN_TG_TOKEN") and os.environ.get("DEN_TG_CHAT"))):
+            try:
+                alerts.send_telegram("DEN: тестовое сообщение, уведомления настроены ✅")
+                st.success("Отправлено")
+            except alerts.TelegramError as e:
+                st.error(str(e))
+        st.caption("Сами уведомления шлёт отдельный процесс: `python run_alerts.py` "
+                   "(или `python -m den.alerts`). Дашборд для этого держать открытым не нужно.")
     use_deriv = st.checkbox("Учитывать деривативы Bybit", value=True,
                             help="Funding, открытый интерес и соотношение лонг/шорт добавляются в консенсус "
                                  "как отдельные голоса. Есть только у фьючерсов Bybit.")
