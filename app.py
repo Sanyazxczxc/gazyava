@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 from den import ai
 from den import indicators as ind
 from den.analysis import analyze, multi_timeframe
+from den.backtest import BYBIT_TAKER_FEE, BTConfig, describe, simulate
 from den.derivatives import derivative_votes, load_derivatives
 from den.data import ASSETS, TIMEFRAMES, load_ohlcv
 from den.forecast import HORIZONS, backtest, horizon_bars, price_ranges, score_series, verdict
@@ -38,7 +39,8 @@ def get_news(symbol: str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_scores(symbol: str, tf: str):
-    return score_series(get(symbol, tf))
+    raw = get(symbol, tf)
+    return score_series(raw, last_n=len(raw))
 
 
 with st.sidebar:
@@ -224,6 +226,47 @@ if bts:
                "сейчас работает не лучше монетки.")
 else:
     st.info("Мало истории для проверки сигналов на этом таймфрейме.")
+
+st.subheader(f"Бэктест консенсуса {tf} как торговой системы")
+with st.expander("Параметры бэктеста", expanded=False):
+    b1, b2, b3, b4 = st.columns(4)
+    bt_fee = b1.number_input("Комиссия за сторону, %", 0.0, 1.0, BYBIT_TAKER_FEE * 100, 0.005, format="%.3f",
+                             help="Тейкер на фьючерсах Bybit 0.055%, мейкер 0.02%.")
+    bt_slip = b2.number_input("Проскальзывание за сторону, %", 0.0, 1.0, 0.02, 0.005, format="%.3f")
+    bt_thr = b3.slider("Порог сигнала", 0.05, 0.6, 0.15, 0.05,
+                       help="Балл консенсуса, от которого открывается сделка (0.15 = «Лонг»/«Шорт»).")
+    bt_hold = b4.number_input("Держать максимум, свечей", 1, 500, max(horizon_bars(raw, 240), 8))
+    b5, b6, b7, b8 = st.columns(4)
+    bt_stop = b5.number_input("Стоп, ATR", 0.5, 10.0, 1.5, 0.5)
+    bt_target = b6.number_input("Цель, ATR", 0.5, 20.0, 3.0, 0.5)
+    bt_flip = b7.checkbox("Выход при развороте сигнала", value=True)
+    bt_short = b8.checkbox("Разрешить шорты", value=True)
+bt_res = simulate(raw, scores, BTConfig(threshold=bt_thr, fee=bt_fee / 100, slippage=bt_slip / 100,
+                                        stop_atr=bt_stop, target_atr=bt_target, max_bars=int(bt_hold),
+                                        exit_on_flip=bt_flip, allow_short=bt_short))
+m = bt_res.metrics
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Сделок", m["trades"], f"лонг {m['longs']} / шорт {m['shorts']}", delta_color="off")
+k2.metric("Прибыльных", f"{m['win_rate']:.0%}" if m["trades"] else "–")
+k3.metric("Profit factor", "–" if not m["trades"] else "∞" if m["profit_factor"] == float("inf")
+          else f"{m['profit_factor']:.2f}")
+k4.metric("Итог", f"{m['total_return']:+.2f}%", f"держать: {m['buy_hold']:+.2f}%", delta_color="off")
+k5.metric("Макс. просадка", f"{m['max_drawdown']:.2f}%")
+st.markdown(describe(m))
+if m["trades"]:
+    efig = go.Figure(go.Scatter(x=bt_res.equity.index, y=(bt_res.equity - 1) * 100, name="Система", fill="tozeroy"))
+    bh = raw["close"].reindex(bt_res.equity.index)
+    efig.add_trace(go.Scatter(x=bh.index, y=(bh / bh.iloc[0] - 1) * 100, name="Купить и держать",
+                              line=dict(dash="dot", color="gray")))
+    efig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="%",
+                       legend=dict(orientation="h"))
+    st.plotly_chart(efig, width="stretch")
+    with st.expander("Последние сделки"):
+        st.dataframe(bt_res.trades.tail(30).iloc[::-1].round(dict.fromkeys(["Цена входа", "Цена выхода", "Результат %"], 3)), hide_index=True, width="stretch")
+st.caption(f"{len(scores)} свечей истории. Вход по открытию следующей свечи после сигнала, выход по стопу, цели, "
+           "развороту сигнала или времени; при одновременном касании стопа и цели считается стоп. "
+           "Деривативы в бэктесте не участвуют (у Bybit по ним короткая история). Прошлые результаты "
+           "не гарантируют будущих.")
 
 st.subheader("Новости")
 if news_err:
