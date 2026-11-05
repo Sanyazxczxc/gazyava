@@ -1,0 +1,68 @@
+from datetime import datetime, timezone
+
+import pytest
+
+from den import ai
+from den.analysis import analyze, multi_timeframe
+from den.forecast import price_ranges, verdict
+from den.news import NewsItem
+from tests.test_analysis import make
+
+
+def test_context_contains_key_data():
+    results = {"15m": analyze(make(0.8), "GC=F", "15m"), "1h": analyze(make(0.5, seed=1), "GC=F", "1h")}
+    score, label = multi_timeframe(results)
+    news = [NewsItem("Gold surges on rate cut bets", "http://a", "Reuters",
+                     datetime(2026, 11, 5, 10, tzinfo=timezone.utc), 0.8)]
+    ctx = ai.build_context("Золото", "XAUTUSDT", results, score, label, verdict=verdict(score, 0.8, None),
+                           ranges=price_ranges(make(0.0)), news=news, news_sentiment={"score": 0.8})
+    for part in ("Золото", "XAUTUSDT", "Таймфрейм 15m", "Таймфрейм 1h", "MACD", "Вердикт DEN",
+                 "Ожидаемый диапазон", "Gold surges on rate cut bets"):
+        assert part in ctx
+
+
+def test_parse_json_variants():
+    body = '{"direction": "лонг", "confidence": "средняя", "summary": "Тренд вверх.", ' \
+           '"key_factors": ["EMA"], "risks": "ФРС", "levels": "стоп 2000"}'
+    for text in (body, f"<think>хм</think>\n```json\n{body}\n```", f"Вот ответ: {body} Удачи"):
+        r = ai.parse_answer(text, "m")
+        assert r.direction == "лонг" and r.confidence == "средняя" and r.risks == ["ФРС"] and r.model == "m"
+    assert ai.parse_answer('{"direction": "Short"}').direction == "шорт"
+
+
+def test_parse_plain_text_fallback():
+    r = ai.parse_answer("Скорее рост, но неуверенно.")
+    assert r.direction == "нейтрально" and "рост" in r.summary
+
+
+class _Resp:
+    def __init__(self, status, data):
+        self.status_code, self._data, self.text = status, data, str(data)
+
+    def json(self):
+        return self._data
+
+
+def test_request_and_errors(monkeypatch):
+    import requests
+
+    sent = {}
+
+    def ok(url, **kw):
+        sent.update(kw)
+        return _Resp(200, {"model": "x/y:free",
+                           "choices": [{"message": {"content": '{"direction": "шорт", "confidence": "низкая"}'}}]})
+
+    monkeypatch.setattr(requests, "post", ok)
+    r = ai.analyze_with_ai("ctx", key="k", model="openrouter/free")
+    assert r.direction == "шорт" and r.model == "x/y:free"
+    assert sent["headers"]["Authorization"] == "Bearer k" and sent["json"]["model"] == "openrouter/free"
+
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _Resp(429, {"error": {"message": "rate"}}))
+    with pytest.raises(ai.AIError, match="Лимит"):
+        ai.analyze_with_ai("ctx", key="k")
+
+    monkeypatch.delenv("DEN_OPENROUTER_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(ai.AIError, match="Нет ключа"):
+        ai.analyze_with_ai("ctx")

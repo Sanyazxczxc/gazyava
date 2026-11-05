@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from den import ai
 from den import indicators as ind
 from den.analysis import analyze, multi_timeframe
 from den.data import ASSETS, TIMEFRAMES, load_ohlcv
@@ -46,6 +48,16 @@ with st.sidebar:
         if key:
             os.environ["DEN_TWELVEDATA_KEY"] = key.strip()
             st.cache_data.clear()
+    with st.expander("ИИ-анализ (OpenRouter)", expanded=not ai.api_key()):
+        if not ai.api_key():
+            or_key = st.text_input("Ключ OpenRouter", type="password",
+                                   help="Ключ с openrouter.ai/keys. Чтобы не вводить каждый раз, "
+                                        "задайте переменную окружения DEN_OPENROUTER_KEY.")
+            if or_key:
+                os.environ["DEN_OPENROUTER_KEY"] = or_key.strip()
+        ai_model = st.text_input("Модель", value=ai.model_name(),
+                                 help="openrouter/free выбирает доступную бесплатную модель. Можно указать "
+                                      "конкретную, например с суффиксом :free, или платную.")
     if st.button("Обновить данные"):
         st.cache_data.clear()
     st.caption("Данные: Bybit, Twelve Data (ключ в DEN_TWELVEDATA_KEY) и Yahoo Finance "
@@ -171,6 +183,38 @@ else:
         mark = "🟢" if n.score > 0.1 else "🔴" if n.score < -0.1 else "⚪"
         st.markdown(f"{mark} [{n.title}]({n.link}) · {n.source} · {n.published:%d.%m %H:%M}")
     st.caption("Тон оценивается по словарю финансовых фраз в заголовках, это грубая оценка.")
+
+st.header("ИИ-анализ")
+ai_slot = f"ai::{symbol}"
+if st.button("Запросить ИИ-анализ", type="primary", disabled=not ai.api_key(),
+             help=None if ai.api_key() else "Сначала задайте ключ OpenRouter в боковой панели."):
+    ctx = ai.build_context(asset, _contract, results, score, label, verdict=v, ranges=rng, backtests=bts,
+                           news=news, news_sentiment=ns)
+    with st.spinner("Модель думает, бесплатные модели иногда отвечают до минуты…"):
+        try:
+            st.session_state[ai_slot] = (ai.analyze_with_ai(ctx, model=ai_model), datetime.now())
+        except ai.AIError as e:
+            st.error(str(e))
+if not ai.api_key():
+    st.info("Добавьте ключ OpenRouter в боковой панели (раздел «ИИ-анализ»), чтобы модель разобрала актив.")
+if ai_slot in st.session_state:
+    res_ai, when = st.session_state[ai_slot]
+    a1, a2 = st.columns([1, 2])
+    with a1:
+        st.metric("Вывод ИИ", res_ai.direction.capitalize(), f"уверенность: {res_ai.confidence}", delta_color="off")
+        st.caption(f"Модель: {res_ai.model} · {when:%H:%M}")
+    with a2:
+        st.markdown(res_ai.summary)
+        if res_ai.levels:
+            st.markdown(f"**Уровни:** {res_ai.levels}")
+    k1, k2 = st.columns(2)
+    with k1:
+        if res_ai.key_factors:
+            st.markdown("**Ключевые факторы**\n" + "\n".join(f"- {x}" for x in res_ai.key_factors))
+    with k2:
+        if res_ai.risks:
+            st.markdown("**Риски**\n" + "\n".join(f"- {x}" for x in res_ai.risks))
+    st.caption("Модель видит только данные этого дашборда и может ошибаться. Не является инвестиционной рекомендацией.")
 
 st.header("Разбор по таймфрейму " + tf)
 left, right = st.columns([3, 2])
