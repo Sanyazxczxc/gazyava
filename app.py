@@ -1,6 +1,8 @@
 """Дашборд DEN. Запуск: streamlit run app.py"""
 from __future__ import annotations
 
+import os
+
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
@@ -25,9 +27,17 @@ with st.sidebar:
     bars = st.slider("Свечей на графике", 50, 500, 200, 10)
     show = st.multiselect("Наложить на график", ["EMA 9/21", "EMA 50/200", "Bollinger", "Уровни"],
                           default=["EMA 9/21", "Bollinger", "Уровни"])
+    if symbol.startswith("TD:") and not os.environ.get("DEN_TWELVEDATA_KEY"):
+        key = st.text_input("Ключ Twelve Data", type="password",
+                            help="Бесплатный ключ с twelvedata.com. Чтобы не вводить каждый раз, "
+                                 "задайте переменную окружения DEN_TWELVEDATA_KEY.")
+        if key:
+            os.environ["DEN_TWELVEDATA_KEY"] = key.strip()
+            st.cache_data.clear()
     if st.button("Обновить данные"):
         st.cache_data.clear()
-    st.caption("Данные Yahoo Finance, задержка до 10–15 минут. Не является инвестиционной рекомендацией.")
+    st.caption("Данные: Bybit, Twelve Data (ключ в DEN_TWELVEDATA_KEY) и Yahoo Finance "
+               "(прокси в DEN_PROXY). Не является инвестиционной рекомендацией.")
 
 results, errors = {}, {}
 with st.spinner("Загружаю данные…"):
@@ -45,6 +55,9 @@ main = results[tf]
 score, label = multi_timeframe(results)
 
 st.title(asset)
+_contract = get(symbol, tf).attrs.get("contract")
+if _contract:
+    st.caption(f"Контракт: {_contract}")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Цена", f"{main.price:,.2f}", f"{main.change_pct:+.2f}% за свечу")
 c2.metric(f"Консенсус {tf}", main.label, f"лонг {main.long_pct:.0f}%")
