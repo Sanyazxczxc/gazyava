@@ -33,9 +33,52 @@ def test_message_text():
     assert "Золото" in msg and "консенсус сменился" in msg and "за лонг" in msg and "15m:" in msg
 
 
+def _setup(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEN_HOME", str(tmp_path))
+    for k in ("DEN_ALERT_STATE", "DEN_ALERT_CONFIG", "DEN_TG_TOKEN", "DEN_TG_CHAT"):
+        monkeypatch.delenv(k, raising=False)
+    alerts.save_config(alerts.AlertConfig(enabled=True, assets=["BYBIT:GOLD"]))
+
+
+def test_disabled_by_default_and_toggle(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEN_HOME", str(tmp_path))
+    monkeypatch.delenv("DEN_ALERT_CONFIG", raising=False)
+    assert alerts.load_config().enabled is False
+    assert alerts.check_once(send=lambda m: 1 / 0, log=lambda *_: None) == 0  # выключено: ничего не делает
+    alerts.main(["--on"])
+    assert alerts.load_config().enabled is True
+    alerts.main(["--off"])
+    assert alerts.load_config().enabled is False
+
+
+def test_config_roundtrip_and_env_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEN_HOME", str(tmp_path))
+    monkeypatch.setenv("DEN_TG_TOKEN", "from-env")
+    alerts.save_config(alerts.AlertConfig(enabled=True, chat_id="7", assets=["BYBIT:AAPL"], on_agree=False,
+                                          agree_tfs=["15m", "1h"], interval=900))
+    c = alerts.load_config()
+    assert (c.enabled, c.chat_id, c.assets, c.on_agree, c.agree_tfs, c.interval) == \
+        (True, "7", ["BYBIT:AAPL"], False, ["15m", "1h"], 900)
+    assert c.token == "from-env"
+
+
+def test_events_can_be_turned_off():
+    prev = {"dir": 1, "agree": 0}
+    cur = {"dir": -1, "agree": -1}
+    assert alerts.detect_events(prev, cur, on_consensus=False) == ["agree"]
+    assert alerts.detect_events(prev, cur, on_agree=False) == ["consensus"]
+
+
+def test_lock_prevents_double_sending(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEN_HOME", str(tmp_path))
+    assert alerts.claim_lock("dashboard", ttl=600)
+    assert not alerts.claim_lock("script", ttl=600)
+    assert alerts.claim_lock("dashboard", ttl=600)
+    assert alerts.claim_lock("script", ttl=0)  # замок устарел
+
+
 def test_check_once_sends_on_change(monkeypatch, tmp_path):
-    monkeypatch.setenv("DEN_ALERT_STATE", str(tmp_path / "state.json"))
-    monkeypatch.setenv("DEN_ALERT_ASSETS", "BYBIT:GOLD")
+    _setup(monkeypatch, tmp_path)
     trend = {"t": 0.8}
     monkeypatch.setattr(alerts, "load_ohlcv", lambda sym, tf: make(trend["t"], seed=hash(tf) % 100))
     monkeypatch.setattr(alerts, "load_derivatives", lambda asset, tf: None)
@@ -48,8 +91,7 @@ def test_check_once_sends_on_change(monkeypatch, tmp_path):
 
 
 def test_failed_send_keeps_old_state(monkeypatch, tmp_path):
-    monkeypatch.setenv("DEN_ALERT_STATE", str(tmp_path / "state.json"))
-    monkeypatch.setenv("DEN_ALERT_ASSETS", "BYBIT:GOLD")
+    _setup(monkeypatch, tmp_path)
     trend = {"t": 0.8}
     monkeypatch.setattr(alerts, "load_ohlcv", lambda sym, tf: make(trend["t"], seed=hash(tf) % 100))
     monkeypatch.setattr(alerts, "load_derivatives", lambda asset, tf: None)

@@ -68,30 +68,49 @@ with st.sidebar:
         ai_model = st.text_input("Модель", value=ai.model_name(),
                                  help="openrouter/free выбирает доступную бесплатную модель. Можно указать "
                                       "конкретную, например с суффиксом :free, или платную.")
-    with st.expander("Уведомления в Telegram"):
-        if not os.environ.get("DEN_TG_TOKEN"):
-            tg_token = st.text_input("Токен бота", type="password", help="Создайте бота у @BotFather.")
-            if tg_token:
-                os.environ["DEN_TG_TOKEN"] = tg_token.strip()
-        if not os.environ.get("DEN_TG_CHAT"):
-            tg_chat = st.text_input("Chat id", help="Напишите боту любое сообщение и нажмите «Найти chat id».")
-            if tg_chat:
-                os.environ["DEN_TG_CHAT"] = tg_chat.strip()
+    alert_cfg = alerts.load_config()
+    with st.expander("Уведомления в Telegram " + ("🔔 вкл." if alert_cfg.enabled else "🔕 выкл.")):
+        with st.form("alerts_form", border=False):
+            f_on = st.toggle("Включить уведомления", value=alert_cfg.enabled)
+            f_token = st.text_input("Токен бота", value=alert_cfg.token, type="password",
+                                    help="Создайте бота у @BotFather командой /newbot.")
+            f_chat = st.text_input("Chat id", value=alert_cfg.chat_id,
+                                   help="Напишите боту любое сообщение и нажмите «Найти chat id».")
+            names = {v: k for k, v in ASSETS.items()}
+            f_assets = st.multiselect("Активы", list(ASSETS.values()), default=[x for x in alert_cfg.assets
+                                                                                if x in names],
+                                      format_func=lambda x: names.get(x, x))
+            f_cons = st.checkbox("При смене общего консенсуса", value=alert_cfg.on_consensus)
+            f_agree = st.checkbox("При совпадении сигналов на таймфреймах", value=alert_cfg.on_agree)
+            f_tfs = st.multiselect("Таймфреймы для совпадения", list(TIMEFRAMES),
+                                   default=[x for x in alert_cfg.agree_tfs if x in TIMEFRAMES])
+            intervals = {60: "1 мин", 300: "5 мин", 900: "15 мин", 1800: "30 мин", 3600: "1 час"}
+            f_int = st.selectbox("Проверять каждые", list(intervals), format_func=intervals.get,
+                                 index=list(intervals).index(alert_cfg.interval) if alert_cfg.interval in intervals else 1)
+            if st.form_submit_button("Сохранить", type="primary"):
+                alerts.save_config(alerts.AlertConfig(
+                    enabled=f_on, token=f_token.strip(), chat_id=f_chat.strip(), assets=f_assets,
+                    on_consensus=f_cons, on_agree=f_agree, agree_tfs=f_tfs or list(alerts.DEFAULT_AGREE),
+                    interval=int(f_int)))
+                st.rerun()
         t1, t2 = st.columns(2)
-        if t1.button("Найти chat id", disabled=not os.environ.get("DEN_TG_TOKEN")):
+        if t1.button("Найти chat id", disabled=not alert_cfg.token):
             try:
                 ids = alerts.chat_ids()
                 st.write("\n".join(f"`{cid}` {who}" for cid, who in ids) or "Боту ещё никто не писал.")
             except alerts.TelegramError as e:
                 st.error(str(e))
-        if t2.button("Тест", disabled=not (os.environ.get("DEN_TG_TOKEN") and os.environ.get("DEN_TG_CHAT"))):
+        if t2.button("Тест", disabled=not (alert_cfg.token and alert_cfg.chat_id)):
             try:
                 alerts.send_telegram("DEN: тестовое сообщение, уведомления настроены ✅")
                 st.success("Отправлено")
             except alerts.TelegramError as e:
                 st.error(str(e))
-        st.caption("Сами уведомления шлёт отдельный процесс: `python run_alerts.py` "
-                   "(или `python -m den.alerts`). Дашборд для этого держать открытым не нужно.")
+        last = alerts.last_check()
+        st.caption(("Последняя проверка: " + last.replace("T", " ") + ". " if alert_cfg.enabled and last else "")
+                   + "Настройки применяются сразу. Пока открыт дашборд, проверки идут в нём; чтобы уведомления "
+                     "шли без дашборда, запустите `python run_alerts.py`.")
+    alerts.start_background()
     use_deriv = st.checkbox("Учитывать деривативы Bybit", value=True,
                             help="Funding, открытый интерес и соотношение лонг/шорт добавляются в консенсус "
                                  "как отдельные голоса. Есть только у фьючерсов Bybit.")
