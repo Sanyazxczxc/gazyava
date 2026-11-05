@@ -10,6 +10,8 @@ from plotly.subplots import make_subplots
 from den import indicators as ind
 from den.analysis import analyze, multi_timeframe
 from den.data import ASSETS, TIMEFRAMES, load_ohlcv
+from den.forecast import HORIZONS, backtest, horizon_bars, price_ranges, score_series, verdict
+from den.news import fetch_news, sentiment
 
 st.set_page_config(page_title="DEN: анализ рынка", layout="wide")
 
@@ -17,6 +19,16 @@ st.set_page_config(page_title="DEN: анализ рынка", layout="wide")
 @st.cache_data(ttl=60, show_spinner=False)
 def get(symbol: str, tf: str):
     return load_ohlcv(symbol, tf)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_news(symbol: str):
+    return fetch_news(symbol)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_scores(symbol: str, tf: str):
+    return score_series(get(symbol, tf))
 
 
 with st.sidebar:
@@ -107,6 +119,60 @@ fig.update_layout(height=750, xaxis_rangeslider_visible=False, margin=dict(l=10,
                   legend=dict(orientation="h"))
 st.plotly_chart(fig, width="stretch")
 
+# Прогноз
+st.header("Прогноз")
+news, news_err = [], None
+try:
+    news = get_news(symbol)
+except Exception as e:  # noqa: BLE001
+    news_err = str(e)
+ns = sentiment(news) if news else None
+raw = get(symbol, tf)
+scores = get_scores(symbol, tf)
+bts = {name: backtest(raw, scores, horizon_bars(raw, m)) for name, m in HORIZONS.items()
+       if horizon_bars(raw, m) < len(scores) // 2}
+v = verdict(score, ns["score"] if ns else None, bts.get("4 часа") or bts.get("1 час"))
+f1, f2 = st.columns([1, 2])
+with f1:
+    st.metric("Прогнозный вердикт", v.label, f"уверенность: {v.confidence}", delta_color="off")
+with f2:
+    st.markdown("\n".join(f"- {r}" for r in v.reasons))
+
+st.subheader("Ожидаемый диапазон цены")
+rng = price_ranges(raw)
+if rng:
+    st.dataframe([{k: (f"{x:,.2f}" if isinstance(x, float) and k != "Ход ±%" else
+                       f"±{x:.2f}%" if k == "Ход ±%" else x) for k, x in r.items()} for r in rng],
+                 hide_index=True, width="stretch")
+    st.caption("Цена с вероятностью около 68% (или 95%) останется в диапазоне, если волатильность "
+               "будет как в последние дни. Направление этот расчёт не предсказывает.")
+
+st.subheader(f"Как сигналы {tf} срабатывали раньше")
+if bts:
+    st.dataframe([{"Через": name,
+                   "Сигналов лонг": b["long"]["n"], "Лонг угадал": f"{b['long']['hit']:.0%}" if b["long"]["n"] else "–",
+                   "Сигналов шорт": b["short"]["n"], "Шорт угадал": f"{b['short']['hit']:.0%}" if b["short"]["n"] else "–",
+                   "Рост без сигнала": f"{b['base_up']:.0%}"} for name, b in bts.items()],
+                 hide_index=True, width="stretch")
+    st.caption(f"Проверка на последних {len(scores)} свечах. Если «угадал» близко к 50%, сигнал на этом активе "
+               "сейчас работает не лучше монетки.")
+else:
+    st.info("Мало истории для проверки сигналов на этом таймфрейме.")
+
+st.subheader("Новости")
+if news_err:
+    st.warning(f"Не удалось загрузить новости: {news_err}")
+elif not news:
+    st.info("Новостей не найдено.")
+else:
+    st.write(f"Тон новостей за 3 дня: {ns['score']:+.2f} (позитивных {ns['positive']}, "
+             f"негативных {ns['negative']}, нейтральных {ns['neutral']}).")
+    for n in news[:15]:
+        mark = "🟢" if n.score > 0.1 else "🔴" if n.score < -0.1 else "⚪"
+        st.markdown(f"{mark} [{n.title}]({n.link}) · {n.source} · {n.published:%d.%m %H:%M}")
+    st.caption("Тон оценивается по словарю финансовых фраз в заголовках, это грубая оценка.")
+
+st.header("Разбор по таймфрейму " + tf)
 left, right = st.columns([3, 2])
 with left:
     st.subheader("Разбор")
