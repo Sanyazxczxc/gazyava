@@ -4,7 +4,8 @@
 
 ## Запуск
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+python run.py                 # то же, что streamlit run app.py; удобно для кнопки Run в PyCharm
 streamlit run app.py          # реальные данные Yahoo Finance
 DEN_DEMO=1 streamlit run app.py   # демо-режим на синтетических данных, без интернета
 python -m den.analysis GC=F   # консенсус в консоли
