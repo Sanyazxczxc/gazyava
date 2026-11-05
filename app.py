@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 from den import ai
 from den import indicators as ind
 from den.analysis import analyze, multi_timeframe
+from den.derivatives import derivative_votes, load_derivatives
 from den.data import ASSETS, TIMEFRAMES, load_ohlcv
 from den.forecast import HORIZONS, backtest, horizon_bars, price_ranges, score_series, verdict
 from den.news import fetch_news, sentiment
@@ -21,6 +22,13 @@ st.set_page_config(page_title="DEN: анализ рынка", layout="wide")
 @st.cache_data(ttl=60, show_spinner=False)
 def get(symbol: str, tf: str):
     return load_ohlcv(symbol, tf)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_deriv(symbol: str, tf: str):
+    if not symbol.startswith("BYBIT:"):
+        return None
+    return load_derivatives(symbol[6:], tf)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -58,16 +66,31 @@ with st.sidebar:
         ai_model = st.text_input("Модель", value=ai.model_name(),
                                  help="openrouter/free выбирает доступную бесплатную модель. Можно указать "
                                       "конкретную, например с суффиксом :free, или платную.")
+    use_deriv = st.checkbox("Учитывать деривативы Bybit", value=True,
+                            help="Funding, открытый интерес и соотношение лонг/шорт добавляются в консенсус "
+                                 "как отдельные голоса. Есть только у фьючерсов Bybit.")
     if st.button("Обновить данные"):
         st.cache_data.clear()
     st.caption("Данные: Bybit, Twelve Data (ключ в DEN_TWELVEDATA_KEY) и Yahoo Finance "
                "(прокси в DEN_PROXY). Не является инвестиционной рекомендацией.")
 
-results, errors = {}, {}
+results, errors, derivs, deriv_err = {}, {}, {}, None
 with st.spinner("Загружаю данные…"):
     for t in TIMEFRAMES:
         try:
-            results[t] = analyze(get(symbol, t), symbol, t)
+            candles = get(symbol, t)
+        except Exception as e:  # noqa: BLE001
+            errors[t] = str(e)
+            continue
+        extra = []
+        if use_deriv:
+            try:
+                derivs[t] = get_deriv(symbol, t)
+                extra = derivative_votes(derivs[t], candles["close"])
+            except Exception as e:  # noqa: BLE001
+                deriv_err = str(e)
+        try:
+            results[t] = analyze(candles, symbol, t, extra_votes=extra)
         except Exception as e:  # noqa: BLE001
             errors[t] = str(e)
 
@@ -130,6 +153,37 @@ for y in (30, 70):
 fig.update_layout(height=750, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10),
                   legend=dict(orientation="h"))
 st.plotly_chart(fig, width="stretch")
+
+# Деривативы
+d_main = derivs.get(tf)
+if use_deriv and (d_main is not None or deriv_err):
+    st.header("Деривативы Bybit")
+    if deriv_err:
+        st.warning(f"Не удалось загрузить данные деривативов: {deriv_err}")
+    if d_main is not None:
+        d1, d2, d3 = st.columns(3)
+        if d_main.funding is not None:
+            d1.metric("Funding (за 8 ч)", f"{d_main.funding * 100:+.4f}%",
+                      f"среднее {d_main.funding_avg * 100:+.4f}%" if d_main.funding_avg is not None else None,
+                      delta_color="off")
+        if len(d_main.oi):
+            oi_ch = d_main.oi.iloc[-1] / d_main.oi.iloc[0] - 1 if d_main.oi.iloc[0] else 0.0
+            d2.metric("Открытый интерес", f"{d_main.oi.iloc[-1]:,.0f}", f"{oi_ch * 100:+.1f}% за {len(d_main.oi)} периодов")
+        if len(d_main.buy_ratio):
+            d3.metric("Аккаунтов в лонге", f"{d_main.buy_ratio.iloc[-1]:.0%}",
+                      f"в шорте {1 - d_main.buy_ratio.iloc[-1]:.0%}", delta_color="off")
+        dfig = make_subplots(specs=[[{"secondary_y": True}]])
+        if len(d_main.oi):
+            dfig.add_trace(go.Scatter(x=d_main.oi.index, y=d_main.oi, name="Открытый интерес"), secondary_y=False)
+        if len(d_main.buy_ratio):
+            dfig.add_trace(go.Scatter(x=d_main.buy_ratio.index, y=d_main.buy_ratio * 100, name="% аккаунтов в лонге",
+                                      line=dict(dash="dot")), secondary_y=True)
+        dfig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
+        st.plotly_chart(dfig, width="stretch")
+        st.caption("Высокий funding и сильный перекос аккаунтов в одну сторону голосуют против толпы. "
+                   "Рост открытого интереса вместе с ценой подтверждает движение.")
+elif use_deriv and symbol.startswith("BYBIT:"):
+    st.caption("Для этого инструмента Bybit не публикует funding и открытый интерес (это спот-токен).")
 
 # Прогноз
 st.header("Прогноз")

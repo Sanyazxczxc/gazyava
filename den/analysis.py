@@ -149,13 +149,19 @@ def levels(df: pd.DataFrame, atr_value: float) -> dict[str, list[float]]:
     }
 
 
-def analyze(df: pd.DataFrame, symbol: str = "", interval: str = "") -> Analysis:
+def weighted_score(votes: list[Vote]) -> float:
+    total_w = sum(v.weight for v in votes)
+    return float(sum(v.score * v.weight for v in votes) / total_w) if total_w else 0.0
+
+
+def analyze(df: pd.DataFrame, symbol: str = "", interval: str = "",
+            extra_votes: list[Vote] | None = None) -> Analysis:
+    """Консенсус по индикаторам; extra_votes добавляют внешние голоса, например деривативы Bybit."""
     if len(df) < 50:
         raise ValueError("Слишком мало свечей для анализа (нужно хотя бы 50)")
     df = ind.add_all(df)
-    votes = collect_votes(df)
-    total_w = sum(v.weight for v in votes)
-    score = sum(v.score * v.weight for v in votes) / total_w if total_w else 0.0
+    votes = collect_votes(df) + list(extra_votes or [])
+    score = weighted_score(votes)
     last = df.iloc[-1]
     price = float(last["close"])
     a = float(last["atr"])
