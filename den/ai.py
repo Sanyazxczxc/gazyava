@@ -215,3 +215,21 @@ def rescore_news(items: list, asset: str, key: str | None = None, model: str | N
 
     scores, used = score_headlines([n.title for n in items], asset, key, model)
     return [replace(n, score=s) for n, s in zip(items, scores)], used
+
+
+def rescore_news_throttled(items: list, asset: str, store: dict, model: str | None = None,
+                           min_interval: float = 1800, now: float | None = None) -> tuple[list, str]:
+    """Как rescore_news, но не чаще раза в min_interval секунд на актив и модель.
+    Между запросами уже оценённые заголовки берут оценку модели, новые — оценку словаря."""
+    import time
+    from dataclasses import replace
+
+    now = time.time() if now is None else now
+    slot = (asset, model or model_name())
+    entry = store.get(slot)
+    if entry and now - entry[0] < min_interval:
+        known = entry[1]
+        return [replace(n, score=known.get(n.title, n.score)) for n in items], entry[2]
+    out, used = rescore_news(items, asset, model=model)
+    store[slot] = (now, {n.title: n.score for n in out}, used)
+    return out, used

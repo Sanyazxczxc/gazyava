@@ -37,10 +37,14 @@ def get_news(symbol: str):
     return fetch_news(symbol)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_ai_news(symbol: str, titles: tuple[str, ...], model: str, _items: list):
-    # Кэш по набору заголовков: пока новых новостей нет, повторного запроса к модели не будет.
-    return ai.rescore_news(_items, asset_key(symbol) or symbol, model=model)
+@st.cache_resource
+def ai_news_store() -> dict:
+    return {}
+
+
+def get_ai_news(symbol: str, model: str, items: list):
+    # Не чаще раза в 30 минут на актив: между запросами новые заголовки оцениваются словарём.
+    return ai.rescore_news_throttled(items, asset_key(symbol) or symbol, ai_news_store(), model=model)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -75,9 +79,8 @@ with st.sidebar:
                                  help="openrouter/free выбирает доступную бесплатную модель. Можно указать "
                                       "конкретную, например с суффиксом :free, или платную.")
         ai_news = st.checkbox("Тон новостей через ИИ", value=True, disabled=not ai.api_key(),
-                              help="Модель оценивает смысл каждого заголовка вместо словаря фраз. Один запрос "
-                                   "на актив, повторяется только при появлении новых заголовков (не чаще "
-                                   "раза в 30 минут). Без ключа или при ошибке используется словарь.")
+                              help="Модель оценивает смысл каждого заголовка вместо словаря фраз. Не больше "
+                                   "одного запроса на актив раз в 30 минут, пока открыт дашборд. Без ключа или при ошибке используется словарь.")
     alert_cfg = alerts.load_config()
     with st.expander("Уведомления в Telegram " + ("🔔 вкл." if alert_cfg.enabled else "🔕 выкл.")):
         with st.form("alerts_form", border=False):
@@ -254,7 +257,7 @@ if news and ai_news and ai.api_key():
         news_ai_err = _fail[1]
     else:
         try:
-            news, used_model = get_ai_news(symbol, tuple(n.title for n in news), ai_model, news)
+            news, used_model = get_ai_news(symbol, ai_model, news)
             news_mode = f"ИИ ({used_model})"
             st.session_state.pop("ai_news_fail", None)
         except ai.AIError as e:
@@ -351,8 +354,8 @@ else:
         st.caption("Тон оценивается по словарю финансовых фраз в заголовках, это грубая оценка. "
                    "Точнее: включите «Тон новостей через ИИ» в боковой панели (нужен ключ OpenRouter).")
     else:
-        st.caption(f"Тон каждого заголовка оценила модель: {news_mode}. Оценка обновляется, когда появляются "
-                   "новые заголовки.")
+        st.caption(f"Тон каждого заголовка оценила модель: {news_mode}. Модель спрашивается не чаще раза "
+                   "в 30 минут на актив; заголовки, появившиеся между запросами, оценены словарём.")
 
 st.header("ИИ-анализ")
 ai_slot = f"ai::{symbol}"
