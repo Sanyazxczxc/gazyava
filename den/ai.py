@@ -93,7 +93,7 @@ def build_context(asset: str, contract: str | None, results: dict, total_score: 
     if news:
         head = "\n## Заголовки новостей за 3 дня (новые сверху)"
         if news_sentiment:
-            head += f", словарный тон {news_sentiment['score']:+.2f}"
+            head += f", тон {news_sentiment['score']:+.2f}"
         lines.append(head)
         for n in news[:max_news]:
             lines.append(f"- {n.published:%d.%m %H:%M} {n.source}: {n.title}")
@@ -131,8 +131,9 @@ def parse_answer(text: str, model: str = "") -> AIResult:
                     model=model, raw=text)
 
 
-def analyze_with_ai(context: str, key: str | None = None, model: str | None = None,
-                    timeout: float = 120) -> AIResult:
+def _chat(messages: list[dict], key: str | None = None, model: str | None = None, timeout: float = 120,
+          max_tokens: int = 4000, temperature: float = 0.3) -> tuple[str, str]:
+    """Один запрос к OpenRouter. Возвращает (текст ответа, имя модели, которая ответила)."""
     import requests
 
     key = key or api_key()
@@ -144,9 +145,8 @@ def analyze_with_ai(context: str, key: str | None = None, model: str | None = No
         r = requests.post(API_URL, timeout=timeout, proxies=proxies,
                           headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                                    "X-Title": "DEN"},
-                          json={"model": model, "temperature": 0.3, "max_tokens": 4000,
-                                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                                             {"role": "user", "content": context}]})
+                          json={"model": model, "temperature": temperature, "max_tokens": max_tokens,
+                                "messages": messages})
     except requests.RequestException as e:
         raise AIError(f"OpenRouter недоступен: {e}") from e
     if r.status_code == 401:
@@ -165,5 +165,53 @@ def analyze_with_ai(context: str, key: str | None = None, model: str | None = No
         msg = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
         raise AIError(f"Неожиданный ответ OpenRouter: {str(data)[:300]}") from None
-    text = msg.get("content") or msg.get("reasoning") or ""
-    return parse_answer(text, data.get("model", model))
+    return msg.get("content") or msg.get("reasoning") or "", data.get("model", model)
+
+
+def analyze_with_ai(context: str, key: str | None = None, model: str | None = None,
+                    timeout: float = 120) -> AIResult:
+    text, used = _chat([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": context}],
+                       key, model, timeout)
+    return parse_answer(text, used)
+
+
+ASSET_TITLES = {"GOLD": "золото (XAU)", "SILVER": "серебро (XAG)", "AAPL": "акции Apple (AAPL)"}
+
+NEWS_PROMPT = """Ты оцениваешь, как новостные заголовки повлияют на цену актива в ближайшие часы и сутки.
+Для каждого заголовка поставь число от -1 до 1: -1 — сильно давит на цену вниз, 0 — не влияет или
+не про этот актив, 1 — сильно толкает вверх. Учитывай смысл, а не отдельные слова: для металлов рост
+доходностей и сильный доллар обычно давят на цену, снижение ставок и геополитические риски поддерживают;
+для акций важны отчёты, прогнозы, рейтинги аналитиков, суды и пошлины.
+Ответь строго одним JSON-объектом без пояснений: {"scores": [числа в том же порядке, ровно N штук]}"""
+
+
+def parse_scores(text: str, n: int) -> list[float]:
+    d = _extract_json(text)
+    vals = d.get("scores") if isinstance(d, dict) else None
+    if not isinstance(vals, list) or len(vals) != n:
+        raise ValueError(f"ожидалось {n} оценок, пришло {len(vals) if isinstance(vals, list) else 0}")
+    return [max(-1.0, min(1.0, float(v))) for v in vals]
+
+
+def score_headlines(titles: list[str], asset: str, key: str | None = None, model: str | None = None,
+                    timeout: float = 90) -> tuple[list[float], str]:
+    """Тон заголовков через модель одним запросом. Возвращает (оценки по порядку, модель)."""
+    if not titles:
+        return [], model or model_name()
+    body = f"Актив: {ASSET_TITLES.get(asset, asset)}. Заголовков: {len(titles)}.\n" + \
+        "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
+    text, used = _chat([{"role": "system", "content": NEWS_PROMPT.replace("N штук", f"{len(titles)} штук")},
+                        {"role": "user", "content": body}], key, model, timeout,
+                       max_tokens=2000, temperature=0.0)
+    try:
+        return parse_scores(text, len(titles)), used
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
+        raise AIError(f"Модель вернула оценки новостей в неожиданном виде: {e}") from None
+
+
+def rescore_news(items: list, asset: str, key: str | None = None, model: str | None = None) -> tuple[list, str]:
+    """Новости с тоном от модели вместо словаря (NewsItem с заменённым score)."""
+    from dataclasses import replace
+
+    scores, used = score_headlines([n.title for n in items], asset, key, model)
+    return [replace(n, score=s) for n, s in zip(items, scores)], used

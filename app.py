@@ -15,7 +15,7 @@ from den.backtest import BYBIT_TAKER_FEE, BTConfig, describe, simulate
 from den.derivatives import derivative_votes, load_derivatives
 from den.data import ASSETS, TIMEFRAMES, load_ohlcv
 from den.forecast import HORIZONS, backtest, horizon_bars, price_ranges, score_series, verdict
-from den.news import fetch_news, sentiment
+from den.news import asset_key, fetch_news, sentiment
 
 st.set_page_config(page_title="DEN: анализ рынка", layout="wide")
 
@@ -35,6 +35,12 @@ def get_deriv(symbol: str, tf: str):
 @st.cache_data(ttl=600, show_spinner=False)
 def get_news(symbol: str):
     return fetch_news(symbol)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_ai_news(symbol: str, titles: tuple[str, ...], model: str, _items: list):
+    # Кэш по набору заголовков: пока новых новостей нет, повторного запроса к модели не будет.
+    return ai.rescore_news(_items, asset_key(symbol) or symbol, model=model)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -68,6 +74,10 @@ with st.sidebar:
         ai_model = st.text_input("Модель", value=ai.model_name(),
                                  help="openrouter/free выбирает доступную бесплатную модель. Можно указать "
                                       "конкретную, например с суффиксом :free, или платную.")
+        ai_news = st.checkbox("Тон новостей через ИИ", value=True, disabled=not ai.api_key(),
+                              help="Модель оценивает смысл каждого заголовка вместо словаря фраз. Один запрос "
+                                   "на актив, повторяется только при появлении новых заголовков (не чаще "
+                                   "раза в 30 минут). Без ключа или при ошибке используется словарь.")
     alert_cfg = alerts.load_config()
     with st.expander("Уведомления в Telegram " + ("🔔 вкл." if alert_cfg.enabled else "🔕 выкл.")):
         with st.form("alerts_form", border=False):
@@ -237,6 +247,19 @@ try:
     news = get_news(symbol)
 except Exception as e:  # noqa: BLE001
     news_err = str(e)
+news_mode, news_ai_err = "словарь", None
+_fail = st.session_state.get("ai_news_fail")  # после ошибки 5 минут не повторяем, чтобы не тратить лимит
+if news and ai_news and ai.api_key():
+    if _fail and (datetime.now() - _fail[0]).total_seconds() < 300:
+        news_ai_err = _fail[1]
+    else:
+        try:
+            news, used_model = get_ai_news(symbol, tuple(n.title for n in news), ai_model, news)
+            news_mode = f"ИИ ({used_model})"
+            st.session_state.pop("ai_news_fail", None)
+        except ai.AIError as e:
+            news_ai_err = str(e)
+            st.session_state["ai_news_fail"] = (datetime.now(), news_ai_err)
 ns = sentiment(news) if news else None
 raw = get(symbol, tf)
 scores = get_scores(symbol, tf)
@@ -322,7 +345,14 @@ else:
     for n in news[:15]:
         mark = "🟢" if n.score > 0.1 else "🔴" if n.score < -0.1 else "⚪"
         st.markdown(f"{mark} [{n.title}]({n.link}) · {n.source} · {n.published:%d.%m %H:%M}")
-    st.caption("Тон оценивается по словарю финансовых фраз в заголовках, это грубая оценка.")
+    if news_ai_err:
+        st.warning(f"ИИ не оценил новости, показан тон по словарю: {news_ai_err}")
+    if news_mode == "словарь":
+        st.caption("Тон оценивается по словарю финансовых фраз в заголовках, это грубая оценка. "
+                   "Точнее: включите «Тон новостей через ИИ» в боковой панели (нужен ключ OpenRouter).")
+    else:
+        st.caption(f"Тон каждого заголовка оценила модель: {news_mode}. Оценка обновляется, когда появляются "
+                   "новые заголовки.")
 
 st.header("ИИ-анализ")
 ai_slot = f"ai::{symbol}"
