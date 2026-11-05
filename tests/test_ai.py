@@ -66,3 +66,47 @@ def test_request_and_errors(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     with pytest.raises(ai.AIError, match="Нет ключа"):
         ai.analyze_with_ai("ctx")
+
+
+def test_score_headlines_parses_and_clips(monkeypatch):
+    sent = {}
+
+    def fake_chat(messages, key=None, model=None, timeout=0, max_tokens=0, temperature=0):
+        sent["user"] = messages[1]["content"]
+        return '```json\n{"scores": [0.8, -2, 0]}\n```', "m:free"
+    monkeypatch.setattr(ai, "_chat", fake_chat)
+    scores, used = ai.score_headlines(["Gold jumps", "Yields soar", "Weather"], "GOLD")
+    assert scores == [0.8, -1.0, 0.0] and used == "m:free"
+    assert "золото" in sent["user"] and "3. Weather" in sent["user"]
+
+
+def test_score_headlines_wrong_length(monkeypatch):
+    monkeypatch.setattr(ai, "_chat", lambda *a, **k: ('{"scores": [0.1]}', "m"))
+    with pytest.raises(ai.AIError, match="ожидалось 2"):
+        ai.score_headlines(["a", "b"], "AAPL")
+
+
+def test_rescore_news_replaces_scores(monkeypatch):
+    monkeypatch.setattr(ai, "_chat", lambda *a, **k: ('{"scores": [-0.5]}', "m"))
+    item = NewsItem("Apple faces EU fine", "http://a", "FT", datetime(2026, 11, 5, tzinfo=timezone.utc), 0.0)
+    out, _ = ai.rescore_news([item], "AAPL")
+    assert out[0].score == -0.5 and out[0].title == item.title and item.score == 0.0
+
+
+def test_news_throttled(monkeypatch):
+    calls = []
+
+    def fake(items, asset, key=None, model=None):
+        calls.append(1)
+        from dataclasses import replace
+        return [replace(n, score=0.9) for n in items], "m"
+    monkeypatch.setattr(ai, "rescore_news", fake)
+    t0 = datetime(2026, 11, 5, tzinfo=timezone.utc)
+    a = NewsItem("Old", "", "", t0, 0.1)
+    b = NewsItem("New", "", "", t0, -0.3)
+    store = {}
+    out, _ = ai.rescore_news_throttled([a], "GOLD", store, "m", now=0)
+    out, _ = ai.rescore_news_throttled([a, b], "GOLD", store, "m", now=600)
+    assert len(calls) == 1 and [n.score for n in out] == [0.9, -0.3]  # новый заголовок: словарь
+    ai.rescore_news_throttled([a, b], "GOLD", store, "m", now=1900)
+    assert len(calls) == 2
