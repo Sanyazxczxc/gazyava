@@ -29,6 +29,7 @@ from pathlib import Path
 from .analysis import Analysis, analyze, multi_timeframe
 from .data import ASSETS, TIMEFRAMES, load_ohlcv
 from .derivatives import derivative_votes, load_derivatives
+from .signals import DEFAULT_MIN_HIT, DEFAULT_THRESHOLD, HIT_TF, Signal, evaluate
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 DEFAULT_ASSETS = ["BYBIT:GOLD", "BYBIT:SILVER", "BYBIT:AAPL"]
@@ -45,7 +46,8 @@ def direction(score: float) -> int:
 
 
 DIR_WORD = {1: "лонг", -1: "шорт", 0: "нейтрально"}
-EVENT_WORD = {"consensus": "смена консенсуса", "agree": "совпадение таймфреймов"}
+EVENT_WORD = {"consensus": "смена консенсуса", "agree": "совпадение таймфреймов",
+              "signal": "сигнал выше порога уверенности"}
 DIR_MARK = {1: "🟢", -1: "🔴", 0: "⚪"}
 
 
@@ -64,7 +66,8 @@ def tg_call(method: str, token: str | None = None, **params) -> dict:
         r = requests.post(TG_API.format(token=token, method=method), json=params, timeout=20, proxies=_proxies())
         js = r.json()
     except (requests.RequestException, ValueError) as e:
-        raise TelegramError(f"Telegram недоступен: {e}") from e
+        # В тексте ошибки requests есть URL, а в нём токен бота: вырезаем, чтобы он не попал в логи и на экран.
+        raise TelegramError(f"Telegram недоступен: {str(e).replace(token, '***')}") from None
     if not js.get("ok"):
         raise TelegramError(f"Telegram: {js.get('description', r.status_code)}")
     return js["result"]
@@ -87,14 +90,18 @@ def chat_ids(token: str | None = None) -> list[tuple[str, str]]:
     return list(out.items())
 
 
-def analyze_symbol(symbol: str, use_deriv: bool = True) -> tuple[dict[str, Analysis], float, str]:
-    """Тот же расчёт, что в дашборде: консенсус по всем таймфреймам, с деривативами Bybit."""
+def analyze_symbol(symbol: str, use_deriv: bool = True,
+                   frames: dict | None = None) -> tuple[dict[str, Analysis], float, str]:
+    """Тот же расчёт, что в дашборде: консенсус по всем таймфреймам, с деривативами Bybit.
+    Если передан словарь frames, в него складываются загруженные свечи по таймфреймам."""
     results = {}
     for tf in TIMEFRAMES:
         try:
             df = load_ohlcv(symbol, tf)
         except Exception:  # noqa: BLE001  таймфрейм не загрузился: считаем по остальным
             continue
+        if frames is not None:
+            frames[tf] = df
         extra = []
         if use_deriv and symbol.startswith("BYBIT:"):
             try:
@@ -111,16 +118,24 @@ def analyze_symbol(symbol: str, use_deriv: bool = True) -> tuple[dict[str, Analy
     return results, score, label
 
 
-def snapshot(results: dict[str, Analysis], score: float, label: str, agree_tfs: list[str]) -> dict:
+def snapshot(results: dict[str, Analysis], score: float, label: str, agree_tfs: list[str],
+             signal: Signal | None = None) -> dict:
     dirs = {tf: direction(r.score) for tf, r in results.items()}
     agree_dirs = {dirs[tf] for tf in agree_tfs if tf in dirs}
     agree = agree_dirs.pop() if len(agree_dirs) == 1 and all(tf in dirs for tf in agree_tfs) else 0
     price = next(iter(results.values())).price
-    return {"label": label, "dir": direction(score), "score": round(score, 4), "agree": agree,
+    snap = {"label": label, "dir": direction(score), "score": round(score, 4), "agree": agree,
             "tf": {tf: r.label for tf, r in results.items()}, "price": price}
+    if signal is not None:
+        snap["signal"] = signal.direction if signal.passed else 0
+        snap["signal_label"] = signal.label
+        snap["confidence"] = round(signal.confidence, 1)
+        snap["confirm"] = signal.confirmation.label
+    return snap
 
 
-def detect_events(prev: dict | None, cur: dict, on_consensus: bool = True, on_agree: bool = True) -> list[str]:
+def detect_events(prev: dict | None, cur: dict, on_consensus: bool = True, on_agree: bool = True,
+                  on_signal: bool = False) -> list[str]:
     """Что изменилось с прошлой проверки. На первой проверке (prev=None) ничего не шлём."""
     if prev is None:
         return []
@@ -129,11 +144,13 @@ def detect_events(prev: dict | None, cur: dict, on_consensus: bool = True, on_ag
         events.append("consensus")
     if on_agree and cur["agree"] and cur["agree"] != prev.get("agree"):
         events.append("agree")
+    if on_signal and cur.get("signal") and cur["signal"] != prev.get("signal"):
+        events.append("signal")
     return events
 
 
 def format_message(symbol: str, cur: dict, prev: dict | None, events: list[str], agree_tfs: list[str],
-                   results: dict[str, Analysis] | None = None) -> str:
+                   results: dict[str, Analysis] | None = None, risk=None) -> str:
     name = NAMES.get(symbol, symbol)
     lines = []
     if "consensus" in events:
@@ -142,14 +159,22 @@ def format_message(symbol: str, cur: dict, prev: dict | None, events: list[str],
     if "agree" in events:
         lines.append(f"{DIR_MARK[cur['agree']]} {name}: все таймфреймы {', '.join(agree_tfs)} "
                      f"за {DIR_WORD[cur['agree']]}")
+    if "signal" in events:
+        lines.append(f"{DIR_MARK[cur['signal']]} {name}: {cur['signal_label']}, уверенность {cur['confidence']:.0f}%")
     lines.append(f"Цена {cur['price']:,.2f}, за лонг {(cur['score'] + 1) / 2 * 100:.0f}%")
+    if "signal_label" in cur:
+        lines.append(f"Сигнал: {cur['signal_label']} ({cur['confidence']:.0f}%), {cur['confirm']}")
     lines.append(" · ".join(f"{tf}: {lbl}" for tf, lbl in cur["tf"].items()))
     if results:
         r = results.get("15m") or next(iter(results.values()))
         deriv = [v for v in r.votes if v.name in ("Funding", "Open interest", "Long/Short")]
         lines += [f"{v.name}: {v.reason}" for v in deriv]
+        if r.regime:
+            lines.append(f"Режим рынка {r.interval}: {r.regime.label.lower()}")
         if r.trade:
             lines.append(f"Ориентир {r.interval}: стоп {r.trade['stop']:,.2f}, цель {r.trade['target1']:,.2f}")
+    if risk is not None and risk.elevated:
+        lines.append(f"⚠️ Геополитика: {risk.label}, размер позиции уменьшить до {risk.size_mult:.0%} от обычного")
     lines.append(f"DEN · {datetime.now():%d.%m %H:%M} · не инвестиционная рекомендация")
     return "\n".join(lines)
 
@@ -164,6 +189,9 @@ class AlertConfig:
     on_agree: bool = True           # совпадение сигналов на agree_tfs
     agree_tfs: list[str] = field(default_factory=lambda: list(DEFAULT_AGREE))
     interval: int = 300             # секунд между проверками
+    on_signal: bool = True          # итоговый сигнал прошёл порог уверенности
+    threshold: float = DEFAULT_THRESHOLD   # порог уверенности, %
+    min_hit: float = DEFAULT_MIN_HIT       # минимальная угадываемость на недавней истории
 
 
 def home_dir() -> Path:
@@ -187,9 +215,16 @@ def _read_json(path: Path) -> dict:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Записать атомарно и только для владельца (0600): в настройках лежит токен бота."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    try:
+        os.chmod(tmp, 0o600)  # если файл уже был с другими правами
+    except OSError:
+        pass
     tmp.replace(path)
 
 
@@ -225,20 +260,25 @@ def check_once(send=send_telegram, log=print, cfg: AlertConfig | None = None) ->
         return 0
     state, sent = load_state(), 0
     for sym in cfg.assets:
+        frames: dict = {}
         try:
-            results, score, label = analyze_symbol(sym)
+            results, score, label = analyze_symbol(sym, frames=frames)
         except Exception as e:  # noqa: BLE001
             log(f"{sym}: ошибка, {e}")
             continue
-        cur = snapshot(results, score, label, cfg.agree_tfs)
+        try:
+            sig = evaluate(results, frames.get(HIT_TF), threshold=cfg.threshold, min_hit=cfg.min_hit)
+        except Exception:  # noqa: BLE001
+            sig = None
+        cur = snapshot(results, score, label, cfg.agree_tfs, sig)
         prev = state.get(sym)
-        events = detect_events(prev, cur, cfg.on_consensus, cfg.on_agree)
+        events = detect_events(prev, cur, cfg.on_consensus, cfg.on_agree, cfg.on_signal)
         log(f"{datetime.now():%H:%M:%S} {sym}: {label} ({cur['score']:+.2f})"
             + (f", события: {', '.join(EVENT_WORD[e] for e in events)}" if events else "")
             + (", первая проверка, запомнил состояние" if prev is None else ""))
         if events:
             try:
-                send(format_message(sym, cur, prev, events, cfg.agree_tfs, results))
+                send(format_message(sym, cur, prev, events, cfg.agree_tfs, results, geo_risk(sym)))
                 sent += 1
             except TelegramError as e:
                 log(f"не отправилось: {e}")
@@ -247,6 +287,31 @@ def check_once(send=send_telegram, log=print, cfg: AlertConfig | None = None) ->
     state["_last_check"] = datetime.now().isoformat(timespec="seconds")
     save_state(state)
     return sent
+
+
+_geo_cache: dict = {}
+
+
+def geo_risk(symbol: str, ttl: float = 1800):
+    """Геополитический фон для сообщения: GPR и словарная разметка новостей, не чаще раза в ttl секунд."""
+    from . import geo
+    from .news import asset_key
+
+    asset = asset_key(symbol)
+    if asset is None:
+        return None
+    now = time.time()
+    if not _geo_cache or now - _geo_cache.get("time", 0) > ttl:
+        try:
+            gpr = geo.gpr_status(geo.load_gpr())
+        except Exception:  # noqa: BLE001
+            gpr = None
+        try:
+            tags = geo.fetch_geo_news()
+        except Exception:  # noqa: BLE001
+            tags = []
+        _geo_cache.update(time=now, gpr=gpr, tags=tags)
+    return geo.risk_backdrop(_geo_cache["gpr"], _geo_cache["tags"], asset)
 
 
 def last_check() -> str | None:

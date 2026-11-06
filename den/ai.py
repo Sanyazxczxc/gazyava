@@ -59,7 +59,8 @@ def _f(x: float) -> str:
 
 def build_context(asset: str, contract: str | None, results: dict, total_score: float, total_label: str,
                   verdict=None, ranges: list[dict] | None = None, backtests: dict | None = None,
-                  news: list | None = None, news_sentiment: dict | None = None, max_news: int = 20) -> str:
+                  news: list | None = None, news_sentiment: dict | None = None, max_news: int = 20,
+                  signal=None, backdrop=None) -> str:
     """Собрать компактную текстовую сводку для модели из того, что уже посчитал дашборд."""
     lines = [f"Актив: {asset}" + (f" (контракт {contract})" if contract else "")]
     any_res = next(iter(results.values()), None)
@@ -68,12 +69,21 @@ def build_context(asset: str, contract: str | None, results: dict, total_score: 
     lines.append(f"Общий консенсус по всем таймфреймам: {total_label} (балл {total_score:+.2f}, от -1 до +1)")
     for tf, r in results.items():
         lines.append(f"\n## Таймфрейм {tf}: {r.label}, за лонг {r.long_pct:.0f}%, "
-                     f"изменение за свечу {r.change_pct:+.2f}%, ATR {_f(r.atr)}")
+                     f"изменение за свечу {r.change_pct:+.2f}%, ATR {_f(r.atr)}"
+                     + (f", режим рынка: {r.regime.label.lower()} ({r.regime.reason})"
+                        if getattr(r, "regime", None) else ""))
         for v in r.votes:
             lines.append(f"- {v.name}: {v.score:+.2f} (вес {v.weight}), {v.reason}")
         if r.levels:
             lines.append("Сопротивления: " + (", ".join(_f(x) for x in r.levels.get("resistance", [])) or "нет"))
             lines.append("Поддержки: " + (", ".join(_f(x) for x in r.levels.get("support", [])) or "нет"))
+    if signal is not None:
+        lines.append(f"\n## Итоговый сигнал DEN: {signal.label}, уверенность {signal.confidence:.0f}% "
+                     f"(порог {signal.threshold:.0f}%)")
+        lines += [f"- {x}" for x in signal.reasons]
+    if backdrop is not None:
+        lines.append(f"\n## Геополитический фон: {backdrop.label} (не голос в консенсусе, влияет на размер позиции)")
+        lines += [f"- {x}" for x in backdrop.reasons]
     if verdict is not None:
         lines.append(f"\n## Вердикт DEN: {verdict.label}, уверенность {verdict.confidence}")
         lines += [f"- {x}" for x in verdict.reasons]
@@ -102,7 +112,7 @@ def build_context(asset: str, contract: str | None, results: dict, total_score: 
 
 def _extract_json(text: str) -> dict:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.S)
     candidate = m.group(1) if m else text[text.find("{"): text.rfind("}") + 1]
     if not candidate:
         raise ValueError("в ответе нет JSON")
@@ -186,8 +196,13 @@ NEWS_PROMPT = """Ты оцениваешь, как новостные загол
 
 
 def parse_scores(text: str, n: int) -> list[float]:
-    d = _extract_json(text)
-    vals = d.get("scores") if isinstance(d, dict) else None
+    try:
+        d = _extract_json(text)
+        vals = d.get("scores") if isinstance(d, dict) else None
+    except (ValueError, json.JSONDecodeError):
+        # Сломанный JSON: берём числа из первого списка [...] после "scores".
+        m = re.search(r"scores\W*\[([^\]]*)", re.sub(r"<think>.*?</think>", "", text, flags=re.S))
+        vals = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", m.group(1))] if m else None
     if not isinstance(vals, list) or len(vals) != n:
         raise ValueError(f"ожидалось {n} оценок, пришло {len(vals) if isinstance(vals, list) else 0}")
     return [max(-1.0, min(1.0, float(v))) for v in vals]
