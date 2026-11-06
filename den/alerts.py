@@ -66,7 +66,8 @@ def tg_call(method: str, token: str | None = None, **params) -> dict:
         r = requests.post(TG_API.format(token=token, method=method), json=params, timeout=20, proxies=_proxies())
         js = r.json()
     except (requests.RequestException, ValueError) as e:
-        raise TelegramError(f"Telegram недоступен: {e}") from e
+        # В тексте ошибки requests есть URL, а в нём токен бота: вырезаем, чтобы он не попал в логи и на экран.
+        raise TelegramError(f"Telegram недоступен: {str(e).replace(token, '***')}") from None
     if not js.get("ok"):
         raise TelegramError(f"Telegram: {js.get('description', r.status_code)}")
     return js["result"]
@@ -214,9 +215,16 @@ def _read_json(path: Path) -> dict:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Записать атомарно и только для владельца (0600): в настройках лежит токен бота."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    try:
+        os.chmod(tmp, 0o600)  # если файл уже был с другими правами
+    except OSError:
+        pass
     tmp.replace(path)
 
 

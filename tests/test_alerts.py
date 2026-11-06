@@ -138,3 +138,28 @@ def test_signal_event_and_message():
     assert "signal" not in alerts.detect_events(prev, snap, on_signal=False)
     msg = alerts.format_message("BYBIT:GOLD", snap, prev, ["signal"], ["5m", "15m", "1h"], res)
     assert "уверенность" in msg and "Режим рынка" in msg
+
+
+def test_token_not_leaked_in_errors(monkeypatch):
+    import requests
+
+    def boom(*a, **k):
+        raise requests.ConnectionError("Max retries exceeded with url: /bot123:SECRET/sendMessage")
+    monkeypatch.setattr(requests, "post", boom)
+    try:
+        alerts.tg_call("getMe", token="123:SECRET")
+    except alerts.TelegramError as e:
+        assert "SECRET" not in str(e) and e.__cause__ is None
+    else:
+        raise AssertionError("ожидалась ошибка")
+
+
+def test_config_file_private(monkeypatch, tmp_path):
+    import os
+    import stat
+
+    monkeypatch.setenv("DEN_HOME", str(tmp_path))
+    monkeypatch.delenv("DEN_ALERT_CONFIG", raising=False)
+    alerts.save_config(alerts.AlertConfig(token="T"))
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(alerts.config_path()).st_mode) == 0o600

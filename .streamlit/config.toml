@@ -1,0 +1,7 @@
+# Дашборд доступен только с этого компьютера: в нём настройки Telegram и ключ OpenRouter.
+[server]
+address = "127.0.0.1"
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

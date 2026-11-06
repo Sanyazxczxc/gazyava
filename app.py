@@ -117,7 +117,9 @@ with st.sidebar:
     with st.expander("Уведомления в Telegram " + ("🔔 вкл." if alert_cfg.enabled else "🔕 выкл.")):
         with st.form("alerts_form", border=False):
             f_on = st.toggle("Включить уведомления", value=alert_cfg.enabled)
-            f_token = st.text_input("Токен бота", value=alert_cfg.token, type="password",
+            # Сохранённый токен в браузер не отправляем: поле пустое, пустое значение = оставить прежний.
+            f_token = st.text_input("Токен бота", value="", type="password",
+                                    placeholder="задан, оставьте пустым, чтобы не менять" if alert_cfg.token else "",
                                     help="Создайте бота у @BotFather командой /newbot.")
             f_chat = st.text_input("Chat id", value=alert_cfg.chat_id,
                                    help="Напишите боту любое сообщение и нажмите «Найти chat id».")
@@ -136,7 +138,7 @@ with st.sidebar:
                                  index=list(intervals).index(alert_cfg.interval) if alert_cfg.interval in intervals else 1)
             if st.form_submit_button("Сохранить", type="primary"):
                 alerts.save_config(alerts.AlertConfig(
-                    enabled=f_on, token=f_token.strip(), chat_id=f_chat.strip(), assets=f_assets,
+                    enabled=f_on, token=f_token.strip() or alert_cfg.token, chat_id=f_chat.strip(), assets=f_assets,
                     on_consensus=f_cons, on_agree=f_agree, agree_tfs=f_tfs or list(alerts.DEFAULT_AGREE),
                     interval=int(f_int), on_signal=f_sig, threshold=float(f_thr), min_hit=alert_cfg.min_hit))
                 st.rerun()
