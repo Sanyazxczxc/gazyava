@@ -75,3 +75,24 @@ def test_ai_tags_parsing_and_throttle(monkeypatch):
     assert out[0].category == "war"
     geo.tag_with_ai_throttled(tags, store, now=100)
     assert len(calls) == 1
+
+
+def test_ai_tags_survive_broken_json():
+    # Пропущена запятая во втором элементе, висячая запятая в третьем: первый и третий должны прочитаться.
+    text = ('{"items": [{"n": 1, "category": "war", "severity": 2, "gold": 0.5, "silver": 0.2, "aapl": -0.3},'
+            '{"n": 2, "category": "tariffs" "severity": 2},'
+            '{"n": 3, "category": "sanctions", "severity": 1, "gold": 0.2, "silver": 0.1, "aapl": -0.1,}]}')
+    rows = geo.parse_ai_tags(text, 3)
+    assert set(rows) == {0, 2} and rows[2][0] == "sanctions"
+    assert geo.parse_ai_tags("извините, не могу", 3) == {}
+
+
+def test_tag_with_ai_batches_and_keeps_dictionary(monkeypatch):
+    import den.ai as ai
+
+    replies = iter(['{"items": [{"n": 1, "category": "war", "severity": 3, "gold": 0.9}]}', "мусор", "мусор"])
+    monkeypatch.setattr(ai, "_chat", lambda *a, **k: (next(replies), "m"))
+    tags = [geo.GeoTag(f"t{i}", "", "", datetime.now(timezone.utc), "tariffs", 1, {}) for i in range(3)]
+    out, _ = geo.tag_with_ai(tags, batch=2)
+    assert out[0].category == "war" and out[0].severity == 3
+    assert out[1].category == "tariffs" and out[2].category == "tariffs"  # не размечены моделью: словарь

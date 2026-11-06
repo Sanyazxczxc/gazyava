@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -197,37 +198,96 @@ GEO_PROMPT = """Ты аналитик геополитических риско�
 ровно N элементов в том же порядке."""
 
 
-def parse_ai_tags(text: str, n: int) -> list[tuple[str, int, dict[str, float]]]:
-    from .ai import _extract_json
+_OBJ = re.compile(r"\{[^{}]*\}", re.S)
 
-    d = _extract_json(text)
-    rows = d.get("items") if isinstance(d, dict) else None
-    if not isinstance(rows, list) or len(rows) != n:
-        raise ValueError(f"ожидалось {n} элементов, пришло {len(rows) if isinstance(rows, list) else 0}")
-    out = []
-    for row in rows:
-        cat = str(row.get("category", "other")).lower()
-        cat = cat if cat in CATEGORY_WORD else "other"
-        sev = int(max(0, min(3, round(float(row.get("severity", 0))))))
-        imp = {a: float(max(-1.0, min(1.0, float(row.get(a.lower(), 0) or 0)))) for a in ASSETS}
-        out.append((cat, sev, imp))
+
+def _loads_lenient(chunk: str):
+    """json.loads с мелким ремонтом: висячие запятые, одинарные кавычки, True/False/None."""
+    try:
+        return json.loads(chunk)
+    except json.JSONDecodeError:
+        fixed = re.sub(r",\s*([}\]])", r"\1", chunk)
+        fixed = re.sub(r"'([^']*)'", r'"\1"', fixed)
+        fixed = re.sub(r"\b(True|False|None)\b", lambda m: {"True": "true", "False": "false", "None": "null"}[m[1]], fixed)
+        return json.loads(fixed)
+
+
+def _row(row: dict) -> tuple[str, int, dict[str, float]]:
+    def num(x, default=0.0) -> float:
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return default
+    cat = str(row.get("category", "other")).lower().strip()
+    cat = cat if cat in CATEGORY_WORD else "other"
+    sev = int(max(0, min(3, round(num(row.get("severity", 0))))))
+    imp = {a: max(-1.0, min(1.0, num(row.get(a.lower(), 0)))) for a in ASSETS}
+    return cat, sev, imp
+
+
+def parse_ai_tags(text: str, n: int) -> dict[int, tuple[str, int, dict[str, float]]]:
+    """Разметка по номерам заголовков (с 0). Бесплатные модели часто ломают JSON, поэтому при ошибке
+    разбираем каждый объект {...} отдельно и берём те, что читаются; остальные останутся словарными."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    rows: list = []
+    try:
+        from .ai import _extract_json
+
+        d = _extract_json(text)
+        rows = d.get("items", []) if isinstance(d, dict) else d if isinstance(d, list) else []
+    except (ValueError, json.JSONDecodeError):
+        for chunk in _OBJ.findall(text):
+            try:
+                obj = _loads_lenient(chunk)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and "category" in obj:
+                rows.append(obj)
+    out = {}
+    for pos, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        try:
+            i = int(row.get("n", pos + 1)) - 1
+        except (TypeError, ValueError):
+            i = pos
+        if 0 <= i < n and i not in out:
+            out[i] = _row(row)
     return out
 
 
+AI_BATCH = 15
+
+
 def tag_with_ai(tags: list[GeoTag], key: str | None = None, model: str | None = None,
-                timeout: float = 90) -> tuple[list[GeoTag], str]:
+                timeout: float = 90, batch: int = AI_BATCH) -> tuple[list[GeoTag], str]:
+    """Разметка через модель пачками по batch заголовков. Что модель не разметила, остаётся словарным.
+    Ошибка только если не удалось разобрать ни одной пачки."""
     from .ai import AIError, _chat
 
     if not tags:
         return [], model or ""
-    body = f"Заголовков: {len(tags)}.\n" + "\n".join(f"{i + 1}. {t.title}" for i, t in enumerate(tags))
-    text, used = _chat([{"role": "system", "content": GEO_PROMPT.replace("ровно N", f"ровно {len(tags)}")},
-                        {"role": "user", "content": body}], key, model, timeout, max_tokens=3000, temperature=0.0)
-    try:
-        parsed = parse_ai_tags(text, len(tags))
-    except (ValueError, TypeError, AttributeError, json.JSONDecodeError) as e:
-        raise AIError(f"Модель вернула разметку новостей в неожиданном виде: {e}") from None
-    return [replace(t, category=c, severity=s, impact=i) for t, (c, s, i) in zip(tags, parsed)], used
+    out, used, parsed_any, last_err = list(tags), model or "", False, None
+    for start in range(0, len(tags), batch):
+        part = tags[start:start + batch]
+        body = f"Заголовков: {len(part)}.\n" + "\n".join(f"{i + 1}. {t.title}" for i, t in enumerate(part))
+        msgs = [{"role": "system", "content": GEO_PROMPT.replace("ровно N", f"ровно {len(part)}")},
+                {"role": "user", "content": body}]
+        got: dict = {}
+        for _attempt in range(2):  # один повтор, если ответ совсем не разобрался
+            text, used = _chat(msgs, key, model, timeout, max_tokens=2000, temperature=0.0)
+            got = parse_ai_tags(text, len(part))
+            if got:
+                break
+        if not got:
+            last_err = "ответ не похож на JSON"
+            continue
+        parsed_any = True
+        for i, (c, sv, im) in got.items():
+            out[start + i] = replace(part[i], category=c, severity=sv, impact=im)
+    if not parsed_any:
+        raise AIError(f"Модель вернула разметку новостей в неожиданном виде: {last_err}")
+    return out, used
 
 
 def tag_with_ai_throttled(tags: list[GeoTag], store: dict, model: str | None = None,

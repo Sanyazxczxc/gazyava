@@ -196,8 +196,13 @@ NEWS_PROMPT = """Ты оцениваешь, как новостные загол
 
 
 def parse_scores(text: str, n: int) -> list[float]:
-    d = _extract_json(text)
-    vals = d.get("scores") if isinstance(d, dict) else None
+    try:
+        d = _extract_json(text)
+        vals = d.get("scores") if isinstance(d, dict) else None
+    except (ValueError, json.JSONDecodeError):
+        # Сломанный JSON: берём числа из первого списка [...] после "scores".
+        m = re.search(r"scores\W*\[([^\]]*)", re.sub(r"<think>.*?</think>", "", text, flags=re.S))
+        vals = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", m.group(1))] if m else None
     if not isinstance(vals, list) or len(vals) != n:
         raise ValueError(f"ожидалось {n} оценок, пришло {len(vals) if isinstance(vals, list) else 0}")
     return [max(-1.0, min(1.0, float(v))) for v in vals]
