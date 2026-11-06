@@ -31,6 +31,58 @@ class Analysis:
     levels: dict[str, list[float]] = field(default_factory=dict)
     trade: dict[str, float] = field(default_factory=dict)
     summary: str = ""
+    regime: "Regime | None" = None
+
+
+# Режим рынка: в тренде доверяем трендовым индикаторам, в боковике осцилляторам.
+TREND_VOTES = ("EMA 9/21", "EMA 50/200", "MACD", "ADX/DMI")
+RANGE_VOTES = ("RSI 14", "Stochastic", "Bollinger")
+REGIME_BOOST, REGIME_CUT = 1.5, 0.5
+ADX_TREND, ADX_RANGE = 25.0, 20.0
+
+
+@dataclass
+class Regime:
+    kind: str          # "trend", "range" или "mixed"
+    adx: float
+    vol_ratio: float   # ATR в % от цены относительно среднего за 100 свечей
+    label: str
+    reason: str
+
+
+def market_regime(df: pd.DataFrame) -> Regime:
+    """Тренд или боковик по ADX; в промежуточной зоне решает волатильность (расширение = тренд)."""
+    last = df.iloc[-1]
+    adx = float(last["adx"]) if not np.isnan(last["adx"]) else 0.0
+    atr_pct = df["atr"] / df["close"]
+    avg = float(atr_pct.tail(100).mean())
+    vol = float(atr_pct.iloc[-1] / avg) if avg > 0 else 1.0
+    if adx >= ADX_TREND:
+        kind, why = "trend", f"ADX {adx:.0f} ≥ {ADX_TREND:.0f}"
+    elif adx <= ADX_RANGE:
+        kind, why = "range", f"ADX {adx:.0f} ≤ {ADX_RANGE:.0f}"
+    elif vol >= 1.3:
+        kind, why = "trend", f"ADX {adx:.0f}, волатильность растёт ({vol:.1f}× от обычной)"
+    elif vol <= 0.8:
+        kind, why = "range", f"ADX {adx:.0f}, волатильность сжата ({vol:.1f}× от обычной)"
+    else:
+        kind, why = "mixed", f"ADX {adx:.0f}, волатильность обычная"
+    label = {"trend": "Тренд", "range": "Боковик", "mixed": "Переходный"}[kind]
+    if vol >= 1.8:
+        label += ", высокая волатильность"
+    return Regime(kind, adx, vol, label, why)
+
+
+def apply_regime(votes: list[Vote], regime: Regime | None) -> list[Vote]:
+    """Перевзвесить голоса под режим рынка. В переходном режиме веса не меняются."""
+    if regime is None or regime.kind == "mixed":
+        return votes
+    up, down = (TREND_VOTES, RANGE_VOTES) if regime.kind == "trend" else (RANGE_VOTES, TREND_VOTES)
+    out = []
+    for v in votes:
+        k = REGIME_BOOST if v.name in up else REGIME_CUT if v.name in down else 1.0
+        out.append(Vote(v.name, v.score, round(v.weight * k, 3), v.reason) if k != 1.0 else v)
+    return out
 
 
 def _clip(x: float) -> float:
@@ -155,12 +207,14 @@ def weighted_score(votes: list[Vote]) -> float:
 
 
 def analyze(df: pd.DataFrame, symbol: str = "", interval: str = "",
-            extra_votes: list[Vote] | None = None) -> Analysis:
-    """Консенсус по индикаторам; extra_votes добавляют внешние голоса, например деривативы Bybit."""
+            extra_votes: list[Vote] | None = None, use_regime: bool = True) -> Analysis:
+    """Консенсус по индикаторам; extra_votes добавляют внешние голоса, например деривативы Bybit.
+    use_regime перевзвешивает индикаторы под режим рынка (тренд или боковик)."""
     if len(df) < 50:
         raise ValueError("Слишком мало свечей для анализа (нужно хотя бы 50)")
     df = ind.add_all(df)
-    votes = collect_votes(df) + list(extra_votes or [])
+    reg = market_regime(df)
+    votes = apply_regime(collect_votes(df), reg if use_regime else None) + list(extra_votes or [])
     score = weighted_score(votes)
     last = df.iloc[-1]
     price = float(last["close"])
@@ -179,7 +233,7 @@ def analyze(df: pd.DataFrame, symbol: str = "", interval: str = "",
         symbol=symbol, interval=interval, price=price,
         change_pct=float(df["close"].pct_change().iloc[-1] * 100),
         votes=votes, score=float(score), long_pct=float((score + 1) / 2 * 100),
-        label=label_for(score), atr=a, levels=lv, trade=trade,
+        label=label_for(score), atr=a, levels=lv, trade=trade, regime=reg,
     )
     res.summary = summarize(res, df)
     return res
@@ -193,7 +247,11 @@ def summarize(a: Analysis, df: pd.DataFrame) -> str:
     lines = [
         f"**{a.label}** на таймфрейме {a.interval}: за лонг {a.long_pct:.0f}%, за шорт {100 - a.long_pct:.0f}%.",
         f"За рост: {', '.join(v.name for v in bulls) or 'нет'}. За снижение: {', '.join(v.name for v in bears) or 'нет'}.",
-        f"Волатильность (ATR) {vol_now:.2f}% от цены, "
+        (f"Режим рынка: {a.regime.label.lower()} ({a.regime.reason}), "
+         + ("вес трендовых индикаторов повышен. " if a.regime.kind == "trend" else
+            "вес осцилляторов повышен. " if a.regime.kind == "range" else "веса без изменений. ")
+         if a.regime else "")
+        + f"Волатильность (ATR) {vol_now:.2f}% от цены, "
         + ("выше" if vol_now > vol_avg * 1.2 else "ниже" if vol_now < vol_avg * 0.8 else "около")
         + f" обычной ({vol_avg:.2f}%).",
     ]

@@ -4,11 +4,12 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from den import ai, alerts
+from den import ai, alerts, geo
 from den import indicators as ind
 from den.analysis import analyze, multi_timeframe
 from den.backtest import BYBIT_TAKER_FEE, BTConfig, describe, simulate
@@ -16,6 +17,7 @@ from den.derivatives import derivative_votes, load_derivatives
 from den.data import ASSETS, TIMEFRAMES, load_ohlcv
 from den.forecast import HORIZONS, backtest, horizon_bars, price_ranges, score_series, verdict
 from den.news import asset_key, fetch_news, sentiment
+from den.signals import DEFAULT_MIN_HIT, DEFAULT_THRESHOLD, HIT_TF, evaluate
 
 st.set_page_config(page_title="DEN: анализ рынка", layout="wide")
 
@@ -48,9 +50,24 @@ def get_ai_news(symbol: str, model: str, items: list):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_scores(symbol: str, tf: str):
+def get_scores(symbol: str, tf: str, use_regime: bool = True):
     raw = get(symbol, tf)
-    return score_series(raw, last_n=len(raw))
+    return score_series(raw, last_n=len(raw), use_regime=use_regime)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_gpr():
+    return geo.load_gpr()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_geo_news():
+    return geo.fetch_geo_news()
+
+
+@st.cache_resource
+def ai_geo_store() -> dict:
+    return {}
 
 
 with st.sidebar:
@@ -81,6 +98,21 @@ with st.sidebar:
         ai_news = st.checkbox("Тон новостей через ИИ", value=True, disabled=not ai.api_key(),
                               help="Модель оценивает смысл каждого заголовка вместо словаря фраз. Не больше "
                                    "одного запроса на актив раз в 30 минут, пока открыт дашборд. Без ключа или при ошибке используется словарь.")
+    with st.expander("Сигнал и риск", expanded=False):
+        use_regime = st.checkbox("Фильтр режима рынка", value=True,
+                                 help="В тренде (ADX ≥ 25) повышается вес скользящих средних, MACD и ADX, "
+                                      "в боковике (ADX ≤ 20) вес RSI, стохастика и Боллинджера.")
+        sig_thr = st.slider("Порог уверенности, %", 50, 95, int(DEFAULT_THRESHOLD), 5,
+                            help="Ниже порога дашборд показывает «нет сигнала».")
+        sig_hit = st.slider("Мин. угадываемость на истории, %", 50, 70, int(DEFAULT_MIN_HIT * 100), 1,
+                            help=f"Доля недавних сигналов той же стороны на {HIT_TF}, после которых цена "
+                                 "через 4 часа ушла в их сторону.") / 100
+        base_risk = st.number_input("Риск на сделку, % депозита", 0.1, 5.0, 1.0, 0.1,
+                                    help="Сколько депозита теряется при срабатывании стопа. При повышенном "
+                                         "геополитическом риске рекомендуемый риск уменьшается.")
+        geo_ai = st.checkbox("Разметка геополитики через ИИ", value=True, disabled=not ai.api_key(),
+                             help="Модель определяет тип события, силу и влияние на каждый актив. Не чаще "
+                                  "раза в 30 минут; без ключа используется словарь.")
     alert_cfg = alerts.load_config()
     with st.expander("Уведомления в Telegram " + ("🔔 вкл." if alert_cfg.enabled else "🔕 выкл.")):
         with st.form("alerts_form", border=False):
@@ -97,6 +129,8 @@ with st.sidebar:
             f_agree = st.checkbox("При совпадении сигналов на таймфреймах", value=alert_cfg.on_agree)
             f_tfs = st.multiselect("Таймфреймы для совпадения", list(TIMEFRAMES),
                                    default=[x for x in alert_cfg.agree_tfs if x in TIMEFRAMES])
+            f_sig = st.checkbox("При сигнале выше порога уверенности", value=alert_cfg.on_signal)
+            f_thr = st.slider("Порог уверенности для уведомлений, %", 50, 95, int(alert_cfg.threshold), 5)
             intervals = {60: "1 мин", 300: "5 мин", 900: "15 мин", 1800: "30 мин", 3600: "1 час"}
             f_int = st.selectbox("Проверять каждые", list(intervals), format_func=intervals.get,
                                  index=list(intervals).index(alert_cfg.interval) if alert_cfg.interval in intervals else 1)
@@ -104,7 +138,7 @@ with st.sidebar:
                 alerts.save_config(alerts.AlertConfig(
                     enabled=f_on, token=f_token.strip(), chat_id=f_chat.strip(), assets=f_assets,
                     on_consensus=f_cons, on_agree=f_agree, agree_tfs=f_tfs or list(alerts.DEFAULT_AGREE),
-                    interval=int(f_int)))
+                    interval=int(f_int), on_signal=f_sig, threshold=float(f_thr), min_hit=alert_cfg.min_hit))
                 st.rerun()
         t1, t2 = st.columns(2)
         if t1.button("Найти chat id", disabled=not alert_cfg.token):
@@ -148,7 +182,7 @@ with st.spinner("Загружаю данные…"):
             except Exception as e:  # noqa: BLE001
                 deriv_err = str(e)
         try:
-            results[t] = analyze(candles, symbol, t, extra_votes=extra)
+            results[t] = analyze(candles, symbol, t, extra_votes=extra, use_regime=use_regime)
         except Exception as e:  # noqa: BLE001
             errors[t] = str(e)
 
@@ -158,6 +192,33 @@ if tf not in results:
 
 main = results[tf]
 score, label = multi_timeframe(results)
+try:
+    _c15 = get(symbol, HIT_TF)
+    signal = evaluate(results, _c15, get_scores(symbol, HIT_TF, use_regime), threshold=sig_thr, min_hit=sig_hit)
+except Exception:  # noqa: BLE001  15m не загрузился
+    signal = evaluate(results, None, threshold=sig_thr, min_hit=sig_hit)
+
+# Геополитический фон: не голос, а предупреждение и множитель размера позиции.
+geo_err, geo_mode, gpr_series, gpr_st, geo_tags = [], "словарь", None, None, []
+try:
+    gpr_series = get_gpr()
+    gpr_st = geo.gpr_status(gpr_series)
+except Exception as e:  # noqa: BLE001
+    geo_err.append(f"индекс GPR: {e}")
+try:
+    geo_tags = get_geo_news()
+except Exception as e:  # noqa: BLE001
+    geo_err.append(f"новости: {e}")
+_gfail = st.session_state.get("ai_geo_fail")
+if geo_tags and geo_ai and ai.api_key() and not (_gfail and (datetime.now() - _gfail[0]).total_seconds() < 300):
+    try:
+        geo_tags, _gm = geo.tag_with_ai_throttled(geo_tags, ai_geo_store(), model=ai_model)
+        geo_mode = f"ИИ ({_gm})"
+        st.session_state.pop("ai_geo_fail", None)
+    except ai.AIError as e:
+        geo_err.append(f"ИИ-разметка: {e}")
+        st.session_state["ai_geo_fail"] = (datetime.now(), str(e))
+backdrop = geo.risk_backdrop(gpr_st, geo_tags, asset_key(symbol) or "GOLD")
 
 st.title(asset)
 _contract = get(symbol, tf).attrs.get("contract")
@@ -169,13 +230,41 @@ c2.metric(f"Консенсус {tf}", main.label, f"лонг {main.long_pct:.0f}
 c3.metric("Общий консенсус", label, f"лонг {(score + 1) / 2 * 100:.0f}%")
 c4.metric("ATR", f"{main.atr:,.2f}", f"{main.atr / main.price * 100:.2f}% от цены", delta_color="off")
 
+if backdrop.elevated:
+    st.warning(f"⚠️ Геополитика: **{backdrop.label}**. Рекомендуемый размер позиции уменьшен до "
+               f"{backdrop.size_mult:.0%} от обычного. " + "; ".join(backdrop.reasons) + ".")
+
+s1, s2 = st.columns([1, 2])
+with s1:
+    st.metric("Итоговый сигнал", signal.label, f"уверенность {signal.confidence:.0f}% (порог {signal.threshold:.0f}%)",
+              delta_color="normal" if signal.passed and signal.direction > 0 else
+              "inverse" if signal.passed else "off")
+    _cs = signal.confirmation.status
+    if _cs == "confirmed":
+        st.badge("подтверждён старшими ТФ", icon="✅", color="green")
+    elif _cs == "partial":
+        st.badge(signal.confirmation.label, icon="🟡", color="orange")
+    elif _cs == "against":
+        st.badge(signal.confirmation.label, icon="⛔", color="red")
+    else:
+        st.badge(signal.confirmation.label, color="gray")
+    st.badge(f"режим {tf}: {main.regime.label.lower()}" if main.regime else "режим не определён",
+             color="blue" if main.regime and main.regime.kind == "trend" else
+             "violet" if main.regime and main.regime.kind == "range" else "gray")
+with s2:
+    st.markdown("\n".join(f"- {r}" for r in signal.reasons))
+    st.caption("Направление задают 5m и 15m, сильным сигнал считается только при подтверждении 1h и 1d. "
+               "Уверенность: 40% сила консенсуса младших ТФ, 35% подтверждение старшими, "
+               "25% недавняя угадываемость.")
+
 # Консенсус по таймфреймам
 cols = st.columns(len(results))
 for col, (t, r) in zip(cols, results.items()):
     with col:
         g = go.Figure(go.Indicator(
             mode="gauge+number", value=r.long_pct, number={"suffix": "%"},
-            title={"text": f"{t}: {r.label}"},
+            title={"text": f"{t}: {r.label}" + (f"<br><span style='font-size:0.7em'>{r.regime.label}</span>"
+                                                       if r.regime else "")},
             gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#444"},
                    "steps": [{"range": [0, 42.5], "color": "#e45756"},
                              {"range": [42.5, 57.5], "color": "#bab0ac"},
@@ -265,7 +354,7 @@ if news and ai_news and ai.api_key():
             st.session_state["ai_news_fail"] = (datetime.now(), news_ai_err)
 ns = sentiment(news) if news else None
 raw = get(symbol, tf)
-scores = get_scores(symbol, tf)
+scores = get_scores(symbol, tf, use_regime)
 bts = {name: backtest(raw, scores, horizon_bars(raw, m)) for name, m in HORIZONS.items()
        if horizon_bars(raw, m) < len(scores) // 2}
 v = verdict(score, ns["score"] if ns else None, bts.get("4 часа") or bts.get("1 час"))
@@ -357,12 +446,46 @@ else:
         st.caption(f"Тон каждого заголовка оценила модель: {news_mode}. Модель спрашивается не чаще раза "
                    "в 30 минут на актив; заголовки, появившиеся между запросами, оценены словарём.")
 
+st.header("Геополитический фон")
+g1, g2 = st.columns([1, 2])
+with g1:
+    st.metric("Уровень риска", backdrop.label.capitalize(), f"размер позиции {backdrop.size_mult:.0%} от обычного",
+              delta_color="off")
+    if gpr_st:
+        st.metric("Индекс GPR (7 дней)", f"{gpr_st.ma7:.0f}", f"выше {gpr_st.percentile:.0%} дней за год",
+                  delta_color="off")
+    if backdrop.impact:
+        st.caption(f"Типичное влияние событий на {asset}: "
+                   + ("скорее вверх" if backdrop.impact > 0.1 else "скорее вниз" if backdrop.impact < -0.1
+                      else "неопределённое") + f" ({backdrop.impact:+.2f}). В консенсус не входит.")
+with g2:
+    st.markdown("\n".join(f"- {r}" for r in backdrop.reasons))
+    if gpr_series is not None and len(gpr_series):
+        _g = gpr_series[gpr_series.index >= gpr_series.index[-1] - pd.Timedelta(days=365)]
+        gfig = go.Figure(go.Scatter(x=_g.index, y=_g, name="GPR за день", line=dict(width=1, color="#bab0ac")))
+        gfig.add_trace(go.Scatter(x=_g.index, y=_g.rolling(7, min_periods=3).mean(), name="Среднее за 7 дней"))
+        gfig.update_layout(height=220, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
+        st.plotly_chart(gfig, width="stretch")
+_key = asset_key(symbol) or "GOLD"
+_shown = [t for t in geo_tags if t.category != "other"]
+if _shown:
+    with st.expander(f"Геополитические заголовки за 2 дня ({len(_shown)})"):
+        st.dataframe([{"Время": f"{t.published:%d.%m %H:%M}", "Тип": geo.CATEGORY_WORD[t.category],
+                       "Сила": "●" * t.severity or "–", f"Влияние на {asset}": round(t.impact.get(_key, 0.0), 2),
+                       "Заголовок": t.title, "Источник": t.source} for t in _shown[:30]],
+                     hide_index=True, width="stretch")
+for e in geo_err:
+    st.warning(f"Геополитический фон посчитан не полностью, {e}")
+st.caption(f"Разметка новостей: {geo_mode}. Индекс GPR (Caldara & Iacoviello) считает долю статей о "
+           "геополитической напряжённости в ведущих газетах. Фон не голосует в консенсусе: он предупреждает "
+           "о риске и уменьшает рекомендуемый размер позиции (повышенный риск 50%, высокий 25%).")
+
 st.header("ИИ-анализ")
 ai_slot = f"ai::{symbol}"
 if st.button("Запросить ИИ-анализ", type="primary", disabled=not ai.api_key(),
              help=None if ai.api_key() else "Сначала задайте ключ OpenRouter в боковой панели."):
     ctx = ai.build_context(asset, _contract, results, score, label, verdict=v, ranges=rng, backtests=bts,
-                           news=news, news_sentiment=ns)
+                           news=news, news_sentiment=ns, signal=signal, backdrop=backdrop)
     with st.spinner("Модель думает, бесплатные модели иногда отвечают до минуты…"):
         try:
             st.session_state[ai_slot] = (ai.analyze_with_ai(ctx, model=ai_model), datetime.now())
@@ -397,6 +520,13 @@ with left:
     if main.trade:
         st.table({k: [f"{v:,.2f}"] for k, v in {"Вход": main.trade["entry"], "Стоп": main.trade["stop"],
                                                   "Цель 1": main.trade["target1"], "Цель 2": main.trade["target2"]}.items()})
+        _stop_pct = abs(main.trade["entry"] - main.trade["stop"]) / main.trade["entry"] * 100
+        _risk, _size = geo.position_size(base_risk, _stop_pct, backdrop.size_mult)
+        st.markdown(f"**Размер позиции:** риск {_risk:.2f}% депозита, объём {_size:.0f}% депозита "
+                    f"(стоп в {_stop_pct:.2f}% от входа)"
+                    + (f". Уменьшен до {backdrop.size_mult:.0%} из-за геополитики." if backdrop.elevated else "."))
+        if not signal.passed:
+            st.caption("Итоговый сигнал не прошёл порог уверенности: ориентиры выше только для справки.")
     st.write("Сопротивления:", ", ".join(f"{x:,.2f}" for x in main.levels["resistance"]) or "нет")
     st.write("Поддержки:", ", ".join(f"{x:,.2f}" for x in main.levels["support"]) or "нет")
 with right:

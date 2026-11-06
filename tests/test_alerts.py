@@ -38,6 +38,7 @@ def _setup(monkeypatch, tmp_path):
     for k in ("DEN_ALERT_STATE", "DEN_ALERT_CONFIG", "DEN_TG_TOKEN", "DEN_TG_CHAT"):
         monkeypatch.delenv(k, raising=False)
     alerts.save_config(alerts.AlertConfig(enabled=True, assets=["BYBIT:GOLD"]))
+    monkeypatch.setattr(alerts, "geo_risk", lambda sym: None)  # без сети
 
 
 def test_disabled_by_default_and_toggle(monkeypatch, tmp_path):
@@ -122,3 +123,18 @@ def test_send_telegram_request(monkeypatch):
     monkeypatch.setattr(requests, "post", post)
     alerts.send_telegram("привет", token="T", chat_id="42")
     assert calls["url"].endswith("/botT/sendMessage") and calls["body"]["chat_id"] == "42"
+
+
+def test_signal_event_and_message():
+    from den.signals import evaluate
+
+    cur, res = _snap({"5m": 0.8, "15m": 0.8, "1h": 0.8, "1d": 0.8})
+    sig = evaluate(res, make(0.8, seed=1))
+    score, label = cur["score"], cur["label"]
+    snap = alerts.snapshot(res, score, label, ["5m", "15m", "1h"], sig)
+    assert snap["signal"] == 1 and "подтверждён" in snap["confirm"]
+    prev = dict(snap, signal=0)
+    assert "signal" in alerts.detect_events(prev, snap, on_signal=True)
+    assert "signal" not in alerts.detect_events(prev, snap, on_signal=False)
+    msg = alerts.format_message("BYBIT:GOLD", snap, prev, ["signal"], ["5m", "15m", "1h"], res)
+    assert "уверенность" in msg and "Режим рынка" in msg
