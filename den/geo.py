@@ -62,7 +62,13 @@ def parse_gpr(raw: pd.DataFrame) -> pd.Series:
 def _read_table(content: bytes, name: str) -> pd.DataFrame:
     if name.endswith(".csv") or content[:1] not in (b"\xd0", b"P"):
         return pd.read_csv(io.BytesIO(content))
-    return pd.read_excel(io.BytesIO(content))  # .xls нужен xlrd, .xlsx openpyxl
+    try:
+        return pd.read_excel(io.BytesIO(content))  # .xls нужен xlrd, .xlsx openpyxl
+    except ImportError as e:
+        lib = "xlrd" if content[:1] == b"\xd0" else "openpyxl"
+        raise RuntimeError(f"для чтения файла GPR не установлен пакет {lib}. Выполните в терминале PyCharm: "
+                           f"python -m pip install {lib} (или pip install -r requirements.txt) "
+                           "и перезапустите дашборд") from None
 
 
 def load_gpr(force: bool = False) -> pd.Series:
