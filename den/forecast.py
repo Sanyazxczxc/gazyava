@@ -13,7 +13,7 @@ import pandas as pd
 from . import indicators as ind
 from .analysis import label_for, score_frame
 
-HORIZONS = {"1 час": 60, "4 часа": 240, "1 день": 1440}
+HORIZONS = {"1 час": 60, "4 часа": 240, "1 день": 1440, "1 неделя": 10080}
 
 
 def bar_minutes(df: pd.DataFrame) -> float:

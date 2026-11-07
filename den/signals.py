@@ -3,6 +3,9 @@
 Логика:
 1. Направление задают младшие таймфреймы (5m и 15m): они должны смотреть в одну сторону.
 2. Старшие (1h и 1d) его подтверждают. Сильный сигнал бывает только при подтверждении обоими.
+   Недельный (1w) задаёт фон: если он против сигнала, подтверждение ослабляется (полное становится
+   частичным, вклад в уверенность умножается на WEEKLY_AGAINST). Если недельной истории мало, 1w
+   просто не учитывается.
 3. Уверенность, %, это вероятность того, что цена пройдёт 1.5 ATR (15m) в сторону сигнала раньше,
    чем 1.5 ATR против него, в пределах 4 часов. Её даёт логистическая регрессия, обученная на
    истории этого актива только по прошлым данным (walk-forward). Пока истории мало, работает
@@ -29,7 +32,9 @@ from .sessions import session_mask
 
 LOWER_TFS = ("5m", "15m")
 HIGHER_TFS = ("1h", "1d")
-ALL_TFS = LOWER_TFS + HIGHER_TFS
+CONTEXT_TFS = ("1w",)
+ALL_TFS = LOWER_TFS + HIGHER_TFS + CONTEXT_TFS
+WEEKLY_AGAINST = 0.7       # множитель подтверждения, если недельный тренд против сигнала
 DEFAULT_THRESHOLD = 70.0   # %, порог уверенности
 DEFAULT_MIN_HIT = 0.55     # минимальная доля удачных сигналов на недавней истории
 MIN_SAMPLES = 10           # сколько прошлых сигналов нужно, чтобы доверять угадываемости
@@ -43,8 +48,8 @@ REFIT_EVERY = 96           # переобучать модель на истор
 CHECK_FEE = 0.00075        # комиссия + проскальзывание за сторону при проверке «по стопу и цели»
 
 DIR_WORD = {1: "лонг", -1: "шорт", 0: "нейтрально"}
-TF_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "1d": 1440}
-FEATURES = ("1", "5m", "15m", "1h", "1d", "подтверждение", "сила")
+TF_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "1d": 1440, "1w": 10080}
+FEATURES = ("1", "5m", "15m", "1h", "1d", "1w", "подтверждение", "сила")
 
 
 def direction(score: float, threshold: float = 0.15) -> int:
@@ -87,6 +92,14 @@ def mtf_confirmation(results: dict[str, Analysis]) -> Confirmation:
              "against": f"против старших ТФ ({', '.join(against)})",
              "partial": f"частично подтверждён ({', '.join(agree)})",
              "none": "старшие ТФ нейтральны"}[status]
+    if dirs.get("1w") == -d:
+        factor *= WEEKLY_AGAINST
+        if status == "confirmed":
+            status, label = "partial", "1h и 1d за, но недельный тренд против"
+        else:
+            label += "; недельный тренд против"
+    elif dirs.get("1w") == d and status != "against":
+        label += "; недельный тренд за"
     return Confirmation(d, status, label, factor, dirs)
 
 
@@ -165,10 +178,11 @@ class ConfidenceModel:
         return _sigmoid(np.atleast_2d(x) @ self.weights)
 
 
-def features(d, s5, s15, s1h, s1d, factor, strength) -> np.ndarray:
-    """Признаки сигнала в его собственную сторону: d * балл, чтобы лонги и шорты учились вместе."""
+def features(d, s5, s15, s1h, s1d, s1w, factor, strength) -> np.ndarray:
+    """Признаки сигнала в его собственную сторону: d * балл, чтобы лонги и шорты учились вместе.
+    Нет данных по ТФ (например, короткая недельная история) — признак равен нулю."""
     d = np.asarray(d, dtype=float)
-    z = [np.nan_to_num(np.asarray(x, dtype=float)) for x in (s5, s15, s1h, s1d)]
+    z = [np.nan_to_num(np.asarray(x, dtype=float)) for x in (s5, s15, s1h, s1d, s1w)]
     return np.column_stack([np.ones_like(d)] + [d * x for x in z]
                            + [np.asarray(factor, dtype=float), np.asarray(strength, dtype=float)])
 
@@ -197,7 +211,7 @@ def align_scores(frames: dict[str, pd.DataFrame], scores: dict[str, pd.Series], 
         bar = _bar(frames[tf], tf)
         s_closed = pd.Series(s.to_numpy(), index=s.index + bar).sort_index()
         s_closed = s_closed[~s_closed.index.duplicated(keep="last")]
-        tol = bar * 3 if tf != "1d" else pd.Timedelta(days=4)
+        tol = bar * 3 if tf not in ("1d", "1w") else pd.Timedelta(days=4) if tf == "1d" else pd.Timedelta(days=15)
         out[tf] = s_closed.reindex(t_close, method="ffill", tolerance=tol).to_numpy()
     return out
 
@@ -228,6 +242,8 @@ def signal_history(frames: dict[str, pd.DataFrame], use_regime: bool = True, ass
     agree = sum((dirs[tf] == d) & (d != 0) for tf in HIGHER_TFS)
     against = sum((dirs[tf] == -d) & (d != 0) for tf in HIGHER_TFS)
     factor = np.select([d == 0, agree == len(HIGHER_TFS), against > 0, agree > 0], [0.0, 1.0, 0.0, 0.6], 0.35)
+    w_against = (dirs["1w"] == -d) & (d != 0)
+    factor = np.where(w_against & (factor == 1.0), 0.6, factor) * np.where(w_against, WEEKLY_AGAINST, 1.0)
     strength = np.minimum(np.abs(np.nanmean(np.column_stack([al["5m"], al["15m"]]), axis=1)) / 0.5, 1.0)
     strength = np.nan_to_num(strength)
 
@@ -251,7 +267,7 @@ def signal_history(frames: dict[str, pd.DataFrame], use_regime: bool = True, ass
         hit[m], hit_n[m] = wins[k[m]], cnt[k[m]]
 
     # Модель уверенности walk-forward: обучаем только на сигналах, исход которых уже известен.
-    x = features(d, al["5m"], al["15m"], al["1h"], al["1d"], factor, strength)
+    x = features(d, al["5m"], al["15m"], al["1h"], al["1d"], al["1w"], factor, strength)
     prob = np.full(n, np.nan)
     sig_idx = np.flatnonzero(d != 0)
     for start in range(0, n, REFIT_EVERY):
@@ -299,6 +315,7 @@ class Signal:
     reasons: list[str] = field(default_factory=list)
     calibrated: bool = False  # уверенность дала модель, а не формула
     rr: float | None = None
+    blockers: list[str] = field(default_factory=list)  # почему сигнал не прошёл фильтры, главное первым
 
     @property
     def label(self) -> str:
@@ -315,10 +332,16 @@ def final_signal(results: dict[str, Analysis], hit: tuple[float, int] | None = N
     conf = mtf_confirmation(results)
     d = conf.direction
     hit_rate, hit_n = hit if hit else (float("nan"), 0)
-    reasons = []
+    reasons, blockers = [], []
+
+    def _block(text: str) -> None:
+        reasons.append(text)
+        blockers.append(text)
+
     if d == 0:
         reasons.append("5m и 15m не смотрят в одну сторону: входа нет")
-        return Signal(0, False, False, 0.0, threshold, hit_rate, hit_n, conf, reasons)
+        return Signal(0, False, False, 0.0, threshold, hit_rate, hit_n, conf, reasons,
+                      blockers=["5m и 15m не смотрят в одну сторону"])
     low = [results[tf].score for tf in LOWER_TFS if tf in results]
     strength = min(abs(float(np.mean(low))) / 0.5, 1.0)
     known = hit_n >= MIN_SAMPLES and not np.isnan(hit_rate)
@@ -342,33 +365,33 @@ def final_signal(results: dict[str, Analysis], hit: tuple[float, int] | None = N
     if held:
         reasons.append(f"сигнал уже действует, порог удержания {need:.0f}%")
     if not passed:
-        reasons.append(f"уверенность {confidence:.0f}% ниже порога {need:.0f}%")
+        _block(f"уверенность {confidence:.0f}% ниже порога {need:.0f}%")
     if known and hit_rate < min_hit:
         passed = False
-        reasons.append(f"угадываемость {hit_rate:.0%} ниже минимума {min_hit:.0%}")
+        _block(f"угадываемость {hit_rate:.0%} ниже минимума {min_hit:.0%}")
     if persisted is False and not held:
         passed = False
-        reasons.append("направление держится только одну свечу 15m: ждём подтверждения на следующей")
+        _block("направление держится только одну свечу 15m: ждём подтверждения на следующей")
     if session_ok is False:
         passed = False
-        reasons.append("основная сессия базового рынка закрыта" + (f" ({session_word})" if session_word else "")
-                       + ": на тонком рынке сигналы ненадёжны")
+        _block("основная сессия базового рынка закрыта" + (f" ({session_word})" if session_word else "")
+               + ": на тонком рынке сигналы ненадёжны")
     rr = None
     tr = results.get(HIT_TF).trade if HIT_TF in results else {}
     if tr and np.sign(tr["target1"] - tr["entry"]) == d:
         rr = float(tr.get("rr", 0.0))
         if check_rr and rr < MIN_RR:
             passed = False
-            reasons.append(f"прибыль/риск до первой цели на {HIT_TF} {rr:.1f}, хуже 1:{MIN_RR:g}")
+            _block(f"прибыль/риск до первой цели на {HIT_TF} {rr:.1f}, хуже 1:{MIN_RR:g}")
     return Signal(d, passed, conf.confirmed, float(confidence), threshold, hit_rate, hit_n, conf, reasons,
-                  calibrated=prob is not None and not np.isnan(prob), rr=rr)
+                  calibrated=prob is not None and not np.isnan(prob), rr=rr, blockers=blockers)
 
 
 def live_features(results: dict[str, Analysis]) -> np.ndarray:
     conf = mtf_confirmation(results)
     s = {tf: results[tf].score if tf in results else np.nan for tf in ALL_TFS}
     strength = min(abs(float(np.nanmean([s["5m"], s["15m"]]))) / 0.5, 1.0)
-    return features([conf.direction], [s["5m"]], [s["15m"]], [s["1h"]], [s["1d"]], [conf.factor], [strength])
+    return features([conf.direction], [s["5m"]], [s["15m"]], [s["1h"]], [s["1d"]], [s["1w"]], [conf.factor], [strength])
 
 
 def evaluate(results: dict[str, Analysis], candles: pd.DataFrame | None = None, scores: pd.Series | None = None,

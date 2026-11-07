@@ -22,7 +22,8 @@ def _frames(trend=0.3, n15=1500, seed=0):
                         "volume": rng.integers(100, 1000, n5)}, index=idx)
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     return {"5m": df5, "15m": df5.resample("15min").agg(agg).dropna(),
-            "1h": df5.resample("1h").agg(agg).dropna(), "1d": df5.resample("1D").agg(agg).dropna()}
+            "1h": df5.resample("1h").agg(agg).dropna(), "1d": df5.resample("1D").agg(agg).dropna(),
+            "1w": df5.resample("W-MON", label="left", closed="left").agg(agg).dropna()}
 
 
 def test_vectorized_score_matches_live_votes():
@@ -58,8 +59,8 @@ def test_signal_history_has_no_lookahead():
     cut = fr["15m"].index[800]
     short = {tf: f[f.index < cut] for tf, f in fr.items()}
     h2 = signal_history(short, asset=None)
-    a = h.frame.loc[h2.frame.index, ["s_5m", "s_15m", "s_1h", "s_1d", "dir"]]
-    b = h2.frame[["s_5m", "s_15m", "s_1h", "s_1d", "dir"]]
+    a = h.frame.loc[h2.frame.index, ["s_5m", "s_15m", "s_1h", "s_1d", "s_1w", "dir"]]
+    b = h2.frame[["s_5m", "s_15m", "s_1h", "s_1d", "s_1w", "dir"]]
     # Последние сутки: дневная свеча в укороченных данных не закрыта иначе, сравниваем до неё.
     keep = b.index < cut - pd.Timedelta(days=1)
     pd.testing.assert_frame_equal(a[keep], b[keep])

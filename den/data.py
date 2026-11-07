@@ -34,10 +34,11 @@ TIMEFRAMES = {
     "15m": "30d",
     "1h": "180d",
     "1d": "2y",
+    "1w": "10y",
 }
 
 BYBIT_URL = "https://api.bybit.com/v5/market"
-BYBIT_INTERVALS = {"5m": "5", "15m": "15", "1h": "60", "1d": "D"}
+BYBIT_INTERVALS = {"5m": "5", "15m": "15", "1h": "60", "1d": "D", "1w": "W"}
 # Кандидаты в порядке предпочтения: сначала фьючерсы (linear), потом токены на споте.
 # Если ни один не торгуется, контракт ищется по ключевым словам в списке инструментов.
 BYBIT_CANDIDATES = {
@@ -50,11 +51,13 @@ BYBIT_KEYWORDS = {"GOLD": ["XAU", "PAXG"], "SILVER": ["XAG", "SILVER"], "AAPL": 
 # Сколько свечей истории держать по каждому таймфрейму. Bybit отдаёт максимум 1000 за запрос,
 # поэтому история подгружается страницами и хранится в локальном кэше (~/.den/cache), а при
 # следующих запусках догружаются только новые свечи. 5m: около 70 дней, 15m: 83 дня, 1h: 250 дней.
-HISTORY_BARS = {"5m": 20000, "15m": 8000, "1h": 6000, "1d": 1000}
+# 1w: до 10 лет, но у токенизированных контрактов Bybit недельная история короткая (с листинга).
+HISTORY_BARS = {"5m": 20000, "15m": 8000, "1h": 6000, "1d": 1000, "1w": 520}
 BYBIT_PAGE = 1000
-BAR_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "1d": 1440}
+BAR_MINUTES = {"5m": 5, "15m": 15, "1h": 60, "1d": 1440, "1w": 10080}
 
-TD_INTERVALS = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1day"}
+TD_INTERVALS = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1day", "1w": "1week"}
+YF_INTERVALS = {"1w": "1wk"}
 TD_URL = "https://api.twelvedata.com/time_series"
 
 
@@ -236,7 +239,7 @@ def load_yahoo(symbol: str, interval: str, period: str | None = None) -> pd.Data
     if proxy:
         yf.set_config(proxy=proxy)
     period = period or TIMEFRAMES.get(interval, "30d")
-    df = yf.download(symbol, interval=interval, period=period, progress=False, auto_adjust=False)
+    df = yf.download(symbol, interval=YF_INTERVALS.get(interval, interval), period=period, progress=False, auto_adjust=False)
     if df is None or df.empty:
         raise ValueError(
             f"Нет данных Yahoo для {symbol} ({interval}). Если Yahoo заблокирован, "
@@ -252,8 +255,8 @@ def demo_ohlcv(symbol: str, interval: str = "15m", n: int | None = None) -> pd.D
     """Синтетические свечи для проверки дашборда без доступа к сети (DEN_DEMO=1)."""
     import numpy as np
 
-    n = n or {"5m": 6000, "15m": 3000, "1h": 1500, "1d": 600}.get(interval, 1000)
-    freq = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1D"}.get(interval, "15min")
+    n = n or {"5m": 6000, "15m": 3000, "1h": 1500, "1d": 600, "1w": 200}.get(interval, 1000)
+    freq = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1D", "1w": "W-MON"}.get(interval, "15min")
     base = {"GC=F": 2650.0, "SI=F": 31.0, "AAPL": 225.0, "BYBIT:GOLD": 2650.0, "BYBIT:SILVER": 31.0, "BYBIT:AAPL": 225.0, "TD:XAU/USD": 2650.0, "TD:XAG/USD": 31.0, "TD:AAPL": 225.0}.get(symbol, 100.0)
     rng = np.random.default_rng(abs(hash((symbol, interval))) % 2**32)
     idx = pd.date_range(end=pd.Timestamp("2026-11-05 18:00"), periods=n, freq=freq)

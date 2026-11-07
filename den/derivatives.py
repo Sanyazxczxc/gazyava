@@ -22,9 +22,10 @@ import pandas as pd
 from .analysis import Vote
 
 # Таймфрейм дашборда -> период OI и long/short у Bybit.
-PERIODS = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1d"}
+# У Bybit нет недельного OI и long/short: для 1w берём дневные значения за неделю.
+PERIODS = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1d", "1w": "1d"}
 # Сколько последних периодов сравнивать для изменения OI и цены.
-OI_LOOKBACK = {"5m": 12, "15m": 8, "1h": 6, "1d": 5}
+OI_LOOKBACK = {"5m": 12, "15m": 8, "1h": 6, "1d": 5, "1w": 7}
 NORMAL_FUNDING = 0.0001  # 0.01% за 8 часов: базовая ставка Bybit, «нейтральное» значение
 
 
@@ -82,7 +83,7 @@ def demo_derivatives(asset: str, interval: str = "15m") -> Derivatives:
     """Синтетические данные для демо-режима (DEN_DEMO=1)."""
     rng = np.random.default_rng(abs(hash((asset, interval, "deriv"))) % 2**32)
     idx = pd.date_range(end=pd.Timestamp("2026-11-05 18:00", tz="UTC"), periods=50,
-                        freq={"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1D"}.get(interval, "15min"))
+                        freq={"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1D", "1w": "1D"}.get(interval, "15min"))
     oi = pd.Series(1e6 * np.exp(np.cumsum(rng.normal(0, 0.01, 50))), index=idx)
     br = pd.Series(np.clip(0.55 + np.cumsum(rng.normal(0, 0.01, 50)), 0.2, 0.8), index=idx)
     fr = float(rng.normal(0.0001, 0.0002))
