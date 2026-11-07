@@ -407,7 +407,7 @@ def summarize(a: Analysis, df: pd.DataFrame) -> str:
 
 def multi_timeframe(results: dict[str, Analysis]) -> tuple[float, str]:
     """Общий консенсус по нескольким таймфреймам; младшие весят больше для краткосрока."""
-    weights = {"5m": 1.0, "15m": 1.5, "1h": 1.5, "1d": 1.0}
+    weights = {"5m": 1.0, "15m": 1.5, "1h": 1.5, "1d": 1.0, "1w": 0.5}
     w = sum(weights.get(k, 1.0) for k in results)
     score = sum(r.score * weights.get(k, 1.0) for k, r in results.items()) / w if w else 0.0
     return score, label_for(score)

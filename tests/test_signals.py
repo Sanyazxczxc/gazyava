@@ -57,3 +57,22 @@ def test_recent_hit_rate_counts_last_signals():
     scores = pd.Series(0.5, index=df.index[100:500])
     hit, n = recent_hit_rate(df, scores, 1, horizon=8, last=40)
     assert n == 40 and hit > 0.6
+
+
+def test_weekly_against_weakens_confirmation():
+    base = {"5m": .8, "15m": .8, "1h": .8, "1d": .8}
+    full = mtf_confirmation(_results(base))
+    weak = mtf_confirmation(_results({**base, "1w": -.8}))
+    assert full.status == "confirmed"
+    assert weak.status == "partial" and "недельный тренд против" in weak.label and weak.factor < full.factor
+    assert mtf_confirmation(_results({**base, "1w": .8})).status == "confirmed"
+    sig = final_signal(_results({**base, "1w": -.8}), (0.9, 50), threshold=50, check_rr=False)
+    assert not sig.strong and sig.label == "лонг"
+
+
+def test_blockers_list_why_no_signal():
+    res = _results({"5m": .8, "15m": .8, "1h": .8, "1d": .8})
+    sig = final_signal(res, (0.9, 50), threshold=101, session_ok=False, check_rr=False)
+    assert not sig.passed and len(sig.blockers) == 2 and "ниже порога" in sig.blockers[0]
+    assert final_signal(res, (0.9, 50), threshold=50, check_rr=False).blockers == []
+    assert final_signal(_results({"5m": .8, "15m": -.8}), threshold=50).blockers
