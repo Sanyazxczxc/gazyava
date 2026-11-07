@@ -63,3 +63,27 @@ def test_no_signals():
     m = simulate(df, s).metrics
     assert m["trades"] == 0 and m["total_return"] == 0
     assert "Сделок не было" in describe(m)
+
+
+def test_breakeven_moves_stop_to_entry():
+    # Вход 100, стоп 98 (R=2). Свеча 2 доходит до 102 (+1R), свеча 3 падает до 99: выход в безубыток по 100.
+    df = _bars([100, 100, 101, 99.5, 99.5])
+    df["atr"] = 1.0
+    df.loc[df.index[2], "high"] = 102
+    df.loc[df.index[3], "low"] = 99
+    s = pd.Series([1.0, 0, 0, 0, 0], index=df.index)
+    cfg = BTConfig(fee=0, slippage=0, stop_atr=2, target_atr=6, exit_on_flip=False, breakeven_r=1.0)
+    t = simulate(df, s, cfg).trades.iloc[0]
+    assert t["Причина"] == "стоп" and t["Цена выхода"] == 100
+    t0 = simulate(df, s, BTConfig(fee=0, slippage=0, stop_atr=2, target_atr=6, exit_on_flip=False)).trades.iloc[0]
+    assert t0["Причина"] != "стоп" or t0["Цена выхода"] != 100
+
+
+def test_confirm_bars_delays_entry():
+    df = _bars([100] * 6)
+    df["atr"] = 1.0
+    s = pd.Series([1.0, 0, 1.0, 1.0, 0, 0], index=df.index)
+    one = simulate(df, s, BTConfig(fee=0, slippage=0, exit_on_flip=False, max_bars=1))
+    two = simulate(df, s, BTConfig(fee=0, slippage=0, exit_on_flip=False, max_bars=1, confirm_bars=2))
+    assert one.trades["Вход"].iloc[0] == df.index[1]
+    assert len(two.trades) == 1 and two.trades["Вход"].iloc[0] == df.index[4]
