@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from . import indicators as ind
-from .analysis import apply_regime, collect_votes, label_for, market_regime
+from .analysis import label_for, score_frame
 
 HORIZONS = {"1 час": 60, "4 часа": 240, "1 день": 1440}
 
@@ -47,18 +47,11 @@ def price_ranges(df: pd.DataFrame, lookback: int = 300) -> list[dict]:
 
 def score_series(df: pd.DataFrame, last_n: int = 400, use_regime: bool = True) -> pd.Series:
     """Балл консенсуса на каждой из последних last_n свечей (как если бы анализ запускали тогда),
-    с тем же перевзвешиванием под режим рынка, что и в живом анализе."""
+    с тем же перевзвешиванием под режим рынка, что и в живом анализе. Все индикаторы считаются
+    только по прошлым свечам, поэтому весь расчёт векторный и подглядывания в будущее нет."""
     full = ind.add_all(df)
     start = max(len(full) - last_n, 60)
-    vals = {}
-    for i in range(start, len(full)):
-        part = full.iloc[: i + 1]
-        votes = collect_votes(part)
-        if use_regime:
-            votes = apply_regime(votes, market_regime(part))
-        w = sum(v.weight for v in votes)
-        vals[full.index[i]] = sum(v.score * v.weight for v in votes) / w if w else 0.0
-    return pd.Series(vals, dtype=float)
+    return score_frame(full, use_regime).iloc[start:].astype(float)
 
 
 def backtest(df: pd.DataFrame, scores: pd.Series, horizon: int, threshold: float = 0.15) -> dict:
