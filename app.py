@@ -100,16 +100,32 @@ with st.sidebar:
         if key:
             os.environ["DEN_TWELVEDATA_KEY"] = key.strip()
             st.cache_data.clear()
-    with st.expander("ИИ-анализ (OpenRouter)", expanded=not ai.api_key()):
-        if not ai.api_key():
-            or_key = st.text_input("Ключ OpenRouter", type="password",
-                                   help="Ключ с openrouter.ai/keys. Чтобы не вводить каждый раз, "
-                                        "задайте переменную окружения DEN_OPENROUTER_KEY.")
+    with st.expander("ИИ-анализ", expanded=not ai.api_key()):
+        _provs = list(ai.PROVIDERS)
+        _cur = ai.provider().name
+        ai_prov = st.selectbox("Провайдер", _provs, index=_provs.index(_cur),
+                               format_func=lambda n: ai.PROVIDERS[n].label,
+                               help="OpenRouter: есть бесплатные модели. Tooken Club: платный посредник, "
+                                    "оплата за токены с баланса. По умолчанию берётся из DEN_AI_PROVIDER.")
+        os.environ["DEN_AI_PROVIDER"] = ai_prov
+        _p = ai.PROVIDERS[ai_prov]
+        if _p.name == "tooken":
+            st.caption("Tooken Club не официальный провайдер моделей. Независимые проверки находили, что "
+                       "часть ответов «Claude» может идти не от оригинальной модели и что токены могут "
+                       "считаться с завышением. Начинайте с небольшого пополнения.")
+        if not ai.api_key(_p):
+            or_key = st.text_input(f"Ключ {_p.label}", type="password",
+                                   help=f"{_p.key_help} Чтобы не вводить каждый раз, "
+                                        f"задайте переменную окружения {_p.key_envs[0]}.")
             if or_key:
-                os.environ["DEN_OPENROUTER_KEY"] = or_key.strip()
-        ai_model = st.text_input("Модель", value=ai.model_name(),
+                os.environ[_p.key_envs[0]] = or_key.strip()
+        ai_model = st.text_input("Модель", value=ai.model_name(_p), key=f"ai_model_{_p.name}",
                                  help="openrouter/free выбирает доступную бесплатную модель. Можно указать "
-                                      "конкретную, например с суффиксом :free, или платную.")
+                                      "конкретную, например с суффиксом :free, или платную."
+                                 if _p.name == "openrouter" else
+                                 "Точное имя модели из раздела «Модели» в личном кабинете tooken.club. "
+                                 f"Можно задать в {_p.model_env}.")
+        ai_model = ai_model.strip() or None
         ai_news = st.checkbox("Тон новостей через ИИ", value=True, disabled=not ai.api_key(),
                               help="Модель оценивает смысл каждого заголовка вместо словаря фраз. Не больше "
                                    "одного запроса на актив раз в 30 минут, пока открыт дашборд. Без ключа или при ошибке используется словарь.")
@@ -529,7 +545,7 @@ else:
         st.warning(f"ИИ не оценил новости, показан тон по словарю: {news_ai_err}")
     if news_mode == "словарь":
         st.caption("Тон оценивается по словарю финансовых фраз в заголовках, это грубая оценка. "
-                   "Точнее: включите «Тон новостей через ИИ» в боковой панели (нужен ключ OpenRouter).")
+                   "Точнее: включите «Тон новостей через ИИ» в боковой панели (нужен ключ ИИ-провайдера).")
     else:
         st.caption(f"Тон каждого заголовка оценила модель: {news_mode}. Модель спрашивается не чаще раза "
                    "в 30 минут на актив; заголовки, появившиеся между запросами, оценены словарём.")
@@ -571,7 +587,7 @@ st.caption(f"Разметка новостей: {geo_mode}. Индекс GPR (Ca
 st.header("ИИ-анализ")
 ai_slot = f"ai::{symbol}"
 if st.button("Запросить ИИ-анализ", type="primary", disabled=not ai.api_key(),
-             help=None if ai.api_key() else "Сначала задайте ключ OpenRouter в боковой панели."):
+             help=None if ai.api_key() else f"Сначала задайте ключ {ai.provider().label} в боковой панели."):
     ctx = ai.build_context(asset, _contract, results, score, label, verdict=v, ranges=rng, backtests=bts,
                            news=news, news_sentiment=ns, signal=signal, backdrop=backdrop)
     with st.spinner("Модель думает, бесплатные модели иногда отвечают до минуты…"):
@@ -580,7 +596,7 @@ if st.button("Запросить ИИ-анализ", type="primary", disabled=no
         except ai.AIError as e:
             st.error(str(e))
 if not ai.api_key():
-    st.info("Добавьте ключ OpenRouter в боковой панели (раздел «ИИ-анализ»), чтобы модель разобрала актив.")
+    st.info(f"Добавьте ключ {ai.provider().label} в боковой панели (раздел «ИИ-анализ»), чтобы модель разобрала актив.")
 if ai_slot in st.session_state:
     res_ai, when = st.session_state[ai_slot]
     a1, a2 = st.columns([1, 2])

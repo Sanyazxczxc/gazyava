@@ -1,7 +1,12 @@
-"""ИИ-анализ через OpenRouter: модель получает всё, что посчитал DEN, и пишет разбор с выводом лонг/шорт.
+"""ИИ-анализ: модель получает всё, что посчитал DEN, и пишет разбор с выводом лонг/шорт.
 
-Ключ берётся из DEN_OPENROUTER_KEY (или OPENROUTER_API_KEY). Модель задаётся в DEN_AI_MODEL;
-по умолчанию `openrouter/free`: OpenRouter сам выбирает доступную бесплатную модель.
+Провайдер выбирается в DEN_AI_PROVIDER: `openrouter` (по умолчанию) или `tooken` (Tooken Club,
+платный посредник с OpenAI-совместимым API). Оба принимают один и тот же формат запроса.
+
+OpenRouter: ключ в DEN_OPENROUTER_KEY (или OPENROUTER_API_KEY), модель в DEN_AI_MODEL, по умолчанию
+`openrouter/free` (OpenRouter сам выбирает доступную бесплатную модель).
+Tooken Club: ключ в DEN_TOOKEN_KEY, модель в DEN_TOOKEN_MODEL (точное имя из раздела «Модели»
+в личном кабинете tooken.club; модели по умолчанию нет).
 """
 from __future__ import annotations
 
@@ -12,6 +17,26 @@ from dataclasses import dataclass, field
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "openrouter/free"
+
+
+@dataclass(frozen=True)
+class Provider:
+    name: str
+    label: str
+    url: str
+    key_envs: tuple[str, ...]
+    model_env: str
+    default_model: str
+    key_help: str
+
+
+PROVIDERS = {
+    "openrouter": Provider("openrouter", "OpenRouter", API_URL, ("DEN_OPENROUTER_KEY", "OPENROUTER_API_KEY"),
+                           "DEN_AI_MODEL", DEFAULT_MODEL, "Ключ с openrouter.ai/keys."),
+    "tooken": Provider("tooken", "Tooken Club", "https://tooken.club/v1/chat/completions", ("DEN_TOOKEN_KEY",),
+                       "DEN_TOOKEN_MODEL", "", "Ключ из личного кабинета tooken.club."),
+}
+DEFAULT_PROVIDER = "openrouter"
 
 SYSTEM_PROMPT = """Ты аналитик краткосрочной торговли фьючерсами и токенизированными активами.
 Тебе дают сводку по одному активу: цену, голоса индикаторов и консенсус по таймфреймам, уровни,
@@ -45,12 +70,26 @@ class AIResult:
     raw: str = ""
 
 
-def api_key() -> str | None:
-    return (os.environ.get("DEN_OPENROUTER_KEY") or os.environ.get("OPENROUTER_API_KEY") or "").strip() or None
+def provider(name: str | None = None) -> Provider:
+    """Текущий провайдер ИИ: аргумент, иначе DEN_AI_PROVIDER, иначе OpenRouter."""
+    name = (name or os.environ.get("DEN_AI_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
+    if name not in PROVIDERS:
+        raise AIError(f"Неизвестный провайдер ИИ «{name}». Возможные: {', '.join(PROVIDERS)}.")
+    return PROVIDERS[name]
 
 
-def model_name() -> str:
-    return (os.environ.get("DEN_AI_MODEL") or DEFAULT_MODEL).strip()
+def api_key(prov: Provider | None = None) -> str | None:
+    prov = prov or provider()
+    for env in prov.key_envs:
+        v = (os.environ.get(env) or "").strip()
+        if v:
+            return v
+    return None
+
+
+def model_name(prov: Provider | None = None) -> str:
+    prov = prov or provider()
+    return (os.environ.get(prov.model_env) or prov.default_model).strip()
 
 
 def _f(x: float) -> str:
@@ -143,38 +182,49 @@ def parse_answer(text: str, model: str = "") -> AIResult:
 
 def _chat(messages: list[dict], key: str | None = None, model: str | None = None, timeout: float = 120,
           max_tokens: int = 4000, temperature: float = 0.3) -> tuple[str, str]:
-    """Один запрос к OpenRouter. Возвращает (текст ответа, имя модели, которая ответила)."""
+    """Один запрос к текущему провайдеру. Возвращает (текст ответа, имя модели, которая ответила)."""
     import requests
 
-    key = key or api_key()
+    prov = provider()
+    name = prov.label
+    key = key or api_key(prov)
     if not key:
-        raise AIError("Нет ключа OpenRouter. Задайте DEN_OPENROUTER_KEY или введите ключ в боковой панели.")
-    model = model or model_name()
+        raise AIError(f"Нет ключа {name}. Задайте {prov.key_envs[0]} или введите ключ в боковой панели.")
+    model = model or model_name(prov)
+    if not model:
+        raise AIError(f"Не указана модель {name}. Задайте {prov.model_env} или введите имя модели "
+                      "в боковой панели.")
     proxies = {"https": os.environ["DEN_PROXY"]} if os.environ.get("DEN_PROXY") else None
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if prov.name == "openrouter":
+        headers["X-Title"] = "DEN"
     try:
-        r = requests.post(API_URL, timeout=timeout, proxies=proxies,
-                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                                   "X-Title": "DEN"},
+        r = requests.post(prov.url, timeout=timeout, proxies=proxies, headers=headers,
                           json={"model": model, "temperature": temperature, "max_tokens": max_tokens,
                                 "messages": messages})
     except requests.RequestException as e:
-        raise AIError(f"OpenRouter недоступен: {e}") from e
+        raise AIError(f"{name} недоступен: {e}") from e
     if r.status_code == 401:
-        raise AIError("OpenRouter не принял ключ (401). Проверьте DEN_OPENROUTER_KEY.")
+        raise AIError(f"{name} не принял ключ (401). Проверьте {prov.key_envs[0]}.")
+    if r.status_code == 402:
+        raise AIError(f"{name}: на балансе не хватает средств (402). Пополните баланс.")
     if r.status_code == 429:
-        raise AIError("Лимит бесплатных запросов OpenRouter исчерпан (429). Подождите минуту "
-                      "или до завтра; после разовой покупки кредитов на $10 лимит вырастет до 1000 в день.")
+        if prov.name == "openrouter":
+            raise AIError("Лимит бесплатных запросов OpenRouter исчерпан (429). Подождите минуту "
+                          "или до завтра; после разовой покупки кредитов на $10 лимит вырастет до 1000 в день.")
+        raise AIError(f"Лимит запросов {name} исчерпан (429). Подождите и повторите.")
     try:
         data = r.json()
     except ValueError:
-        raise AIError(f"OpenRouter вернул {r.status_code}: {r.text[:300]}") from None
-    if r.status_code >= 400 or "error" in data:
-        msg = (data.get("error") or {}).get("message") if isinstance(data.get("error"), dict) else data.get("error")
-        raise AIError(f"OpenRouter вернул ошибку {r.status_code}: {msg or r.text[:300]}")
+        raise AIError(f"{name} вернул {r.status_code}: {r.text[:300]}") from None
+    if r.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
+        err = data.get("error") if isinstance(data, dict) else None
+        msg = err.get("message") if isinstance(err, dict) else err
+        raise AIError(f"{name} вернул ошибку {r.status_code}: {msg or r.text[:300]}")
     try:
         msg = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
-        raise AIError(f"Неожиданный ответ OpenRouter: {str(data)[:300]}") from None
+        raise AIError(f"Неожиданный ответ {name}: {str(data)[:300]}") from None
     return msg.get("content") or msg.get("reasoning") or "", data.get("model", model)
 
 

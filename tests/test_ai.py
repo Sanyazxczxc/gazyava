@@ -110,3 +110,37 @@ def test_news_throttled(monkeypatch):
     assert len(calls) == 1 and [n.score for n in out] == [0.9, -0.3]  # новый заголовок: словарь
     ai.rescore_news_throttled([a, b], "GOLD", store, "m", now=1900)
     assert len(calls) == 2
+
+
+def test_tooken_provider(monkeypatch):
+    import requests
+
+    sent = {}
+
+    def ok(url, **kw):
+        sent.update(kw, url=url)
+        return _Resp(200, {"model": "deepseek-chat",
+                           "choices": [{"message": {"content": '{"direction": "лонг", "confidence": "средняя"}'}}]})
+
+    monkeypatch.setenv("DEN_AI_PROVIDER", "tooken")
+    monkeypatch.setenv("DEN_OPENROUTER_KEY", "or-key")
+    monkeypatch.delenv("DEN_TOOKEN_KEY", raising=False)
+    monkeypatch.delenv("DEN_TOOKEN_MODEL", raising=False)
+    monkeypatch.setattr(requests, "post", ok)
+    assert ai.api_key() is None  # ключ OpenRouter не уходит в Tooken Club
+    with pytest.raises(ai.AIError, match="Нет ключа Tooken Club"):
+        ai.analyze_with_ai("ctx")
+    monkeypatch.setenv("DEN_TOOKEN_KEY", "tk")
+    with pytest.raises(ai.AIError, match="Не указана модель"):
+        ai.analyze_with_ai("ctx")
+    monkeypatch.setenv("DEN_TOOKEN_MODEL", "deepseek-chat")
+    r = ai.analyze_with_ai("ctx")
+    assert r.direction == "лонг" and r.model == "deepseek-chat"
+    assert sent["url"] == "https://tooken.club/v1/chat/completions"
+    assert sent["headers"]["Authorization"] == "Bearer tk" and "X-Title" not in sent["headers"]
+    monkeypatch.setattr(requests, "post", lambda url, **kw: _Resp(402, {"error": {"message": "balance"}}))
+    with pytest.raises(ai.AIError, match="баланс"):
+        ai.analyze_with_ai("ctx")
+    monkeypatch.setenv("DEN_AI_PROVIDER", "nope")
+    with pytest.raises(ai.AIError, match="Неизвестный провайдер"):
+        ai.provider()
