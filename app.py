@@ -19,7 +19,8 @@ from den.data import ASSETS, TIMEFRAMES, load_ohlcv
 from den.forecast import HORIZONS, backtest, horizon_bars, price_ranges, score_series, verdict
 from den.news import asset_key, fetch_news, sentiment
 from den.sessions import SESSION_WORD
-from den.signals import BARRIER_ATR, DEFAULT_MIN_HIT, DEFAULT_THRESHOLD, HIT_TF, evaluate, signal_history
+from den.signals import (BARRIER_ATR, DEFAULT_MIN_HIT, DEFAULT_THRESHOLD, DIR_WORD, HIT_TF, direction, evaluate,
+                         signal_history)
 
 st.set_page_config(page_title="DEN: анализ рынка", layout="wide")
 
@@ -89,10 +90,13 @@ with st.sidebar:
     st.header("Настройки")
     asset = st.selectbox("Актив", list(ASSETS))
     symbol = ASSETS[asset]
-    tf = st.selectbox("Таймфрейм графика", list(TIMEFRAMES), index=1)
-    bars = st.slider("Свечей на графике", 50, 500, 200, 10)
-    show = st.multiselect("Наложить на график", ["EMA 9/21", "EMA 50/200", "Bollinger", "Уровни"],
-                          default=["EMA 9/21", "Bollinger", "Уровни"])
+    tf = st.selectbox("Таймфрейм графика и разбора", list(TIMEFRAMES), index=1,
+                      help="Итоговый сигнал всегда считается по всем таймфреймам сразу; здесь выбирается, "
+                           "какой из них показать на графике и в прогнозе.")
+    with st.expander("Вид графика"):
+        bars = st.slider("Свечей на графике", 50, 500, 200, 10)
+        show = st.multiselect("Наложить на график", ["EMA 9/21", "EMA 50/200", "Bollinger", "Уровни"],
+                              default=["EMA 9/21", "Bollinger", "Уровни"])
     if symbol.startswith("TD:") and not os.environ.get("DEN_TWELVEDATA_KEY"):
         key = st.text_input("Ключ Twelve Data", type="password",
                             help="Бесплатный ключ с twelvedata.com. Чтобы не вводить каждый раз, "
@@ -273,125 +277,7 @@ if geo_tags and geo_ai and ai.api_key() and not (_gfail and (datetime.now() - _g
         st.session_state["ai_geo_fail"] = (datetime.now(), str(e))
 backdrop = geo.risk_backdrop(gpr_st, geo_tags, asset_key(symbol) or "GOLD")
 
-st.title(asset)
-_contract = get(symbol, tf).attrs.get("contract")
-if _contract:
-    st.caption(f"Контракт: {_contract}")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Цена", f"{main.price:,.2f}", f"{main.change_pct:+.2f}% за свечу")
-c2.metric(f"Консенсус {tf}", main.label, f"лонг {main.long_pct:.0f}%")
-c3.metric("Общий консенсус", label, f"лонг {(score + 1) / 2 * 100:.0f}%")
-c4.metric("ATR", f"{main.atr:,.2f}", f"{main.atr / main.price * 100:.2f}% от цены", delta_color="off")
-
-if backdrop.elevated:
-    st.warning(f"⚠️ Геополитика: **{backdrop.label}**. Рекомендуемый размер позиции уменьшен до "
-               f"{backdrop.size_mult:.0%} от обычного. " + "; ".join(backdrop.reasons) + ".")
-
-s1, s2 = st.columns([1, 2])
-with s1:
-    st.metric("Итоговый сигнал", signal.label, f"уверенность {signal.confidence:.0f}% (порог {signal.threshold:.0f}%)",
-              delta_color="normal" if signal.passed and signal.direction > 0 else
-              "inverse" if signal.passed else "off")
-    _cs = signal.confirmation.status
-    if _cs == "confirmed":
-        st.badge("подтверждён старшими ТФ", icon="✅", color="green")
-    elif _cs == "partial":
-        st.badge(signal.confirmation.label, icon="🟡", color="orange")
-    elif _cs == "against":
-        st.badge(signal.confirmation.label, icon="⛔", color="red")
-    else:
-        st.badge(signal.confirmation.label, color="gray")
-    st.badge(f"режим {tf}: {main.regime.label.lower()}" if main.regime else "режим не определён",
-             color="blue" if main.regime and main.regime.kind == "trend" else
-             "violet" if main.regime and main.regime.kind == "range" else "gray")
-with s2:
-    st.markdown("\n".join(f"- {r}" for r in signal.reasons))
-    st.caption("Направление задают 5m и 15m, сильным сигнал считается только при подтверждении 1h и 1d. "
-               + (f"Уверенность — вероятность пройти {BARRIER_ATR:g} ATR (15m) в сторону сигнала раньше, чем "
-                  "против, по модели, обученной на истории этого актива. " if signal.calibrated else
-                  "Уверенность (истории для модели пока мало): 40% сила консенсуса младших ТФ, 35% "
-                  "подтверждение старшими, 25% недавняя угадываемость. ")
-               + "Сигнал должен держаться две свечи 15m; уже действующий держится до порога на 10 п.п. ниже."
-               + (f" Сессия: {SESSION_WORD[asset_key(symbol)]}." if session_filter and asset_key(symbol) in SESSION_WORD
-                  else ""))
-
-# Консенсус по таймфреймам
-cols = st.columns(len(results))
-for col, (t, r) in zip(cols, results.items()):
-    with col:
-        g = go.Figure(go.Indicator(
-            mode="gauge+number", value=r.long_pct, number={"suffix": "%"},
-            title={"text": f"{t}: {r.label}" + (f"<br><span style='font-size:0.7em'>{r.regime.label}</span>"
-                                                       if r.regime else "")},
-            gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#444"},
-                   "steps": [{"range": [0, 42.5], "color": "#e45756"},
-                             {"range": [42.5, 57.5], "color": "#bab0ac"},
-                             {"range": [57.5, 100], "color": "#54a24b"}]}))
-        g.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=0))
-        st.plotly_chart(g, width="stretch")
-
-# График
-df = ind.add_all(get(symbol, tf)).tail(bars)
-fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
-fig.add_trace(go.Candlestick(x=df.index, open=df.open, high=df.high, low=df.low, close=df.close, name="Цена"), 1, 1)
-if "EMA 9/21" in show:
-    fig.add_trace(go.Scatter(x=df.index, y=df.ema9, name="EMA9", line=dict(width=1)), 1, 1)
-    fig.add_trace(go.Scatter(x=df.index, y=df.ema21, name="EMA21", line=dict(width=1)), 1, 1)
-if "EMA 50/200" in show:
-    fig.add_trace(go.Scatter(x=df.index, y=df.ema50, name="EMA50", line=dict(width=1)), 1, 1)
-    fig.add_trace(go.Scatter(x=df.index, y=df.ema200, name="EMA200", line=dict(width=1)), 1, 1)
-if "Bollinger" in show:
-    for c in ("bb_up", "bb_low"):
-        fig.add_trace(go.Scatter(x=df.index, y=df[c], name=c, line=dict(width=1, dash="dot", color="gray")), 1, 1)
-if "Уровни" in show:
-    for y in main.levels["resistance"]:
-        fig.add_hline(y=y, line=dict(color="#e45756", dash="dash", width=1), row=1, col=1)
-    for y in main.levels["support"]:
-        fig.add_hline(y=y, line=dict(color="#54a24b", dash="dash", width=1), row=1, col=1)
-fig.add_trace(go.Bar(x=df.index, y=df["hist"], name="MACD hist",
-                     marker_color=["#54a24b" if v >= 0 else "#e45756" for v in df["hist"]]), 2, 1)
-fig.add_trace(go.Scatter(x=df.index, y=df["macd"], name="MACD", line=dict(width=1)), 2, 1)
-fig.add_trace(go.Scatter(x=df.index, y=df["signal"], name="Signal", line=dict(width=1)), 2, 1)
-fig.add_trace(go.Scatter(x=df.index, y=df.rsi, name="RSI"), 3, 1)
-for y in (30, 70):
-    fig.add_hline(y=y, line=dict(color="gray", dash="dot", width=1), row=3, col=1)
-fig.update_layout(height=750, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10),
-                  legend=dict(orientation="h"))
-st.plotly_chart(fig, width="stretch")
-
-# Деривативы
-d_main = derivs.get(tf)
-if use_deriv and (d_main is not None or deriv_err):
-    st.header("Деривативы Bybit")
-    if deriv_err:
-        st.warning(f"Не удалось загрузить данные деривативов: {deriv_err}")
-    if d_main is not None:
-        d1, d2, d3 = st.columns(3)
-        if d_main.funding is not None:
-            d1.metric("Funding (за 8 ч)", f"{d_main.funding * 100:+.4f}%",
-                      f"среднее {d_main.funding_avg * 100:+.4f}%" if d_main.funding_avg is not None else None,
-                      delta_color="off")
-        if len(d_main.oi):
-            oi_ch = d_main.oi.iloc[-1] / d_main.oi.iloc[0] - 1 if d_main.oi.iloc[0] else 0.0
-            d2.metric("Открытый интерес", f"{d_main.oi.iloc[-1]:,.0f}", f"{oi_ch * 100:+.1f}% за {len(d_main.oi)} периодов")
-        if len(d_main.buy_ratio):
-            d3.metric("Аккаунтов в лонге", f"{d_main.buy_ratio.iloc[-1]:.0%}",
-                      f"в шорте {1 - d_main.buy_ratio.iloc[-1]:.0%}", delta_color="off")
-        dfig = make_subplots(specs=[[{"secondary_y": True}]])
-        if len(d_main.oi):
-            dfig.add_trace(go.Scatter(x=d_main.oi.index, y=d_main.oi, name="Открытый интерес"), secondary_y=False)
-        if len(d_main.buy_ratio):
-            dfig.add_trace(go.Scatter(x=d_main.buy_ratio.index, y=d_main.buy_ratio * 100, name="% аккаунтов в лонге",
-                                      line=dict(dash="dot")), secondary_y=True)
-        dfig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
-        st.plotly_chart(dfig, width="stretch")
-        st.caption("Высокий funding и сильный перекос аккаунтов в одну сторону голосуют против толпы. "
-                   "Рост открытого интереса вместе с ценой подтверждает движение.")
-elif use_deriv and symbol.startswith("BYBIT:"):
-    st.caption("Для этого инструмента Bybit не публикует funding и открытый интерес (это спот-токен).")
-
-# Прогноз
-st.header("Прогноз")
+# Прогноз и новости считаем заранее: их итог нужен в главном блоке.
 news, news_err = [], None
 try:
     news = get_news(symbol)
@@ -416,235 +302,399 @@ scores = get_scores(symbol, tf, use_regime)
 bts = {name: backtest(raw, scores, horizon_bars(raw, m)) for name, m in HORIZONS.items()
        if horizon_bars(raw, m) < len(scores) // 2}
 v = verdict(score, ns["score"] if ns else None, bts.get("4 часа") or bts.get("1 час"))
-f1, f2 = st.columns([1, 2])
-with f1:
-    st.metric("Прогнозный вердикт", v.label, f"уверенность: {v.confidence}", delta_color="off")
-with f2:
-    st.markdown("\n".join(f"- {r}" for r in v.reasons))
 
-st.subheader("Ожидаемый диапазон цены")
-rng = price_ranges(raw)
-if rng:
-    st.dataframe([{k: (f"{x:,.2f}" if isinstance(x, float) and k != "Ход ±%" else
-                       f"±{x:.2f}%" if k == "Ход ±%" else x) for k, x in r.items()} for r in rng],
-                 hide_index=True, width="stretch")
-    st.caption("Цена с вероятностью около 68% (или 95%) останется в диапазоне, если волатильность "
-               "будет как в последние дни. Направление этот расчёт не предсказывает.")
+# ---------- Главное: итоговый сигнал, что делать, предупреждения ----------
+_contract = get(symbol, tf).attrs.get("contract")
+st.title(asset)
+st.caption(" · ".join(x for x in (
+    f"Контракт {_contract}" if _contract else "",
+    f"цена {main.price:,.2f} ({main.change_pct:+.2f}% за свечу {tf})",
+    f"ATR {tf} {main.atr:,.2f} ({main.atr / main.price * 100:.2f}% от цены)",
+    f"обновлено в {datetime.now():%H:%M}") if x))
 
-st.subheader(f"Как сигналы {tf} срабатывали раньше")
-if bts:
-    st.dataframe([{"Через": name,
-                   "Сигналов лонг": b["long"]["n"], "Лонг угадал": f"{b['long']['hit']:.0%}" if b["long"]["n"] else "–",
-                   "Сигналов шорт": b["short"]["n"], "Шорт угадал": f"{b['short']['hit']:.0%}" if b["short"]["n"] else "–",
-                   "Рост без сигнала": f"{b['base_up']:.0%}"} for name, b in bts.items()],
-                 hide_index=True, width="stretch")
-    st.caption(f"Проверка на последних {len(scores)} свечах. Если «угадал» близко к 50%, сигнал на этом активе "
-               "сейчас работает не лучше монетки.")
-else:
-    st.info("Мало истории для проверки сигналов на этом таймфрейме.")
+DIR_ICON = {1: "🟢", -1: "🔴", 0: "⚪"}
+_dir = signal.direction if signal.passed else 0
+_trade = results[HIT_TF].trade if HIT_TF in results else {}
+_weekly = signal.confirmation.dirs.get("1w")
+with st.container(border=True):
+    h1, h2 = st.columns([2, 3], gap="large")
+    with h1:
+        st.caption("Итоговый сигнал")
+        st.markdown(f"## {DIR_ICON[_dir]} {signal.label[:1].upper() + signal.label[1:]}")
+        st.progress(min(max(signal.confidence / 100, 0.0), 1.0),
+                    text=f"Уверенность {signal.confidence:.0f}% при пороге {signal.threshold:.0f}%"
+                    if signal.direction else "Уверенность не считается: у сигнала нет направления")
+        _cs = signal.confirmation.status
+        if _cs == "confirmed":
+            st.badge("подтверждён старшими ТФ", icon="✅", color="green")
+        elif _cs == "partial":
+            st.badge(signal.confirmation.label, icon="🟡", color="orange")
+        elif _cs == "against":
+            st.badge(signal.confirmation.label, icon="⛔", color="red")
+        else:
+            st.badge(signal.confirmation.label, color="gray")
+    with h2:
+        if signal.passed and _trade:
+            _word = "лонг (покупку)" if _dir > 0 else "шорт (продажу)"
+            st.markdown(f"**Что делать:** можно рассматривать {_word}. Ориентиры по {HIT_TF}:")
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Вход", f"{_trade['entry']:,.2f}")
+            p2.metric("Стоп", f"{_trade['stop']:,.2f}")
+            p3.metric("Цель", f"{_trade['target1']:,.2f}", f"вторая {_trade['target2']:,.2f}", delta_color="off")
+            p4.metric("Прибыль/риск", f"{_trade.get('rr', 0):.1f}")
+            _stop_pct = abs(_trade["entry"] - _trade["stop"]) / _trade["entry"] * 100
+            _risk, _size = geo.position_size(base_risk, _stop_pct, backdrop.size_mult)
+            st.markdown(f"**Размер позиции:** {_size:.0f}% депозита, риск {_risk:.2f}% депозита"
+                        + (f" (уменьшен до {backdrop.size_mult:.0%} из-за геополитики)." if backdrop.elevated else "."))
+        else:
+            st.markdown("**Что делать:** входа сейчас нет, лучше подождать.")
+            if signal.blockers:
+                st.markdown(f"**Главная причина:** {signal.blockers[0]}"
+                            + (f" (и ещё {len(signal.blockers) - 1})" if len(signal.blockers) > 1 else "") + ".")
+            if signal.direction:
+                st.markdown(f"Младшие таймфреймы склоняются в {DIR_WORD[signal.direction]}, но фильтры его не пропустили.")
+        st.markdown(f"**Общая картина:** все таймфреймы вместе: {label.lower()} (лонг {(score + 1) / 2 * 100:.0f}%); "
+                    f"прогноз: {v.label.lower()} (уверенность {v.confidence}).")
 
-st.subheader("Бэктест итогового сигнала")
-if history is not None and (history.frame["side"] != 0).any():
-    _base = get(symbol, HIT_TF)
-    with st.expander("Параметры бэктеста итогового сигнала", expanded=False):
-        q1, q2, q3, q4 = st.columns(4)
-        fs_stop = q1.number_input("Стоп, ATR 15m", 0.5, 10.0, 1.5, 0.5, key="fs_stop")
-        fs_target = q2.number_input("Цель, ATR 15m", 0.5, 20.0, 3.0, 0.5, key="fs_target")
-        fs_be = q3.number_input("Безубыток после, R", 0.0, 5.0, 1.0, 0.5, key="fs_be",
-                                help="Когда цена прошла столько расстояний до стопа, стоп переносится в точку входа. 0 — выкл.")
-        fs_hold = q4.number_input("Держать максимум, свечей 15m", 1, 500, 32, key="fs_hold")
-    fs = simulate_signal(_base, history.frame["side"], BTConfig(
-        fee=BYBIT_TAKER_FEE, slippage=0.0002, stop_atr=fs_stop, target_atr=fs_target, max_bars=int(fs_hold),
-        breakeven_r=fs_be))
-    fm = fs.metrics
-    j1, j2, j3, j4, j5 = st.columns(5)
-    j1.metric("Сделок", fm["trades"], f"лонг {fm['longs']} / шорт {fm['shorts']}", delta_color="off")
-    j2.metric("Прибыльных", f"{fm['win_rate']:.0%}" if fm["trades"] else "–")
-    j3.metric("Profit factor", "–" if not fm["trades"] else "∞" if fm["profit_factor"] == float("inf")
-              else f"{fm['profit_factor']:.2f}")
-    j4.metric("Итог", f"{fm['total_return']:+.2f}%", f"держать: {fm['buy_hold']:+.2f}%", delta_color="off")
-    j5.metric("Макс. просадка", f"{fm['max_drawdown']:.2f}%")
-    st.markdown(describe(fm))
-    if fm["trades"]:
-        sfig = go.Figure(go.Scatter(x=fs.equity.index, y=(fs.equity - 1) * 100, name="Итоговый сигнал", fill="tozeroy"))
-        sfig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="%")
-        st.plotly_chart(sfig, width="stretch")
-    _h = history.frame
-    _known = _h[(_h["side"] != 0) & _h["outcome"].notna()]
-    st.caption(f"Та же логика, что у живого сигнала (подтверждение старшими ТФ, порог {sig_thr}%, угадываемость, "
-               "две свечи подряд, сессии), прогнанная по истории 15m без заглядывания в будущее: старшие ТФ "
-               "берутся только по закрытым свечам, модель уверенности переобучается раз в сутки только на "
-               f"прошлых сигналах. История: {len(_h)} свечей 15m с {_h.index[0]:%d.%m.%Y}"
-               + (f", из них с сигналом {len(_known)}, до цели раньше стопа {_known['outcome'].mean():.0%}"
-                  if len(_known) else "")
-               + ". Комиссия тейкера Bybit и проскальзывание учтены. Деривативы, связка металлов и фильтр "
-                 "прибыль/риск в историю не входят.")
-elif history is not None:
-    st.info("На истории итоговый сигнал ни разу не прошёл все фильтры: проверять нечего. "
-            "Можно снизить порог уверенности в боковой панели.")
-else:
-    st.info("Мало истории 15m для бэктеста итогового сигнала.")
+    _tcols = st.columns(len(results))
+    for _c, (t, r) in zip(_tcols, results.items()):
+        _c.markdown(f"**{t}** {DIR_ICON[direction(r.score)]} {r.label}")
+        _c.caption(f"лонг {r.long_pct:.0f}%" + (f" · {r.regime.label.lower()}" if r.regime else ""))
 
-st.subheader(f"Бэктест консенсуса {tf} как торговой системы")
-with st.expander("Параметры бэктеста", expanded=False):
-    b1, b2, b3, b4 = st.columns(4)
-    bt_fee = b1.number_input("Комиссия за сторону, %", 0.0, 1.0, BYBIT_TAKER_FEE * 100, 0.005, format="%.3f",
-                             help="Тейкер на фьючерсах Bybit 0.055%, мейкер 0.02%.")
-    bt_slip = b2.number_input("Проскальзывание за сторону, %", 0.0, 1.0, 0.02, 0.005, format="%.3f")
-    bt_thr = b3.slider("Порог сигнала", 0.05, 0.6, 0.15, 0.05,
-                       help="Балл консенсуса, от которого открывается сделка (0.15 = «Лонг»/«Шорт»).")
-    bt_hold = b4.number_input("Держать максимум, свечей", 1, 500, max(horizon_bars(raw, 240), 8))
-    b5, b6, b7, b8 = st.columns(4)
-    bt_stop = b5.number_input("Стоп, ATR", 0.5, 10.0, 1.5, 0.5)
-    bt_target = b6.number_input("Цель, ATR", 0.5, 20.0, 3.0, 0.5)
-    bt_flip = b7.checkbox("Выход при развороте сигнала", value=True)
-    bt_short = b8.checkbox("Разрешить шорты", value=True)
-    b9, b10, _, _ = st.columns(4)
-    bt_be = b9.number_input("Безубыток после, R", 0.0, 5.0, 0.0, 0.5, help="0 — выкл.")
-    bt_confirm = b10.number_input("Сигнал держится, свечей", 1, 5, 1)
-bt_res = simulate(raw, scores, BTConfig(threshold=bt_thr, fee=bt_fee / 100, slippage=bt_slip / 100,
-                                        stop_atr=bt_stop, target_atr=bt_target, max_bars=int(bt_hold),
-                                        exit_on_flip=bt_flip, allow_short=bt_short, breakeven_r=bt_be,
-                                        confirm_bars=int(bt_confirm)))
-m = bt_res.metrics
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Сделок", m["trades"], f"лонг {m['longs']} / шорт {m['shorts']}", delta_color="off")
-k2.metric("Прибыльных", f"{m['win_rate']:.0%}" if m["trades"] else "–")
-k3.metric("Profit factor", "–" if not m["trades"] else "∞" if m["profit_factor"] == float("inf")
-          else f"{m['profit_factor']:.2f}")
-k4.metric("Итог", f"{m['total_return']:+.2f}%", f"держать: {m['buy_hold']:+.2f}%", delta_color="off")
-k5.metric("Макс. просадка", f"{m['max_drawdown']:.2f}%")
-st.markdown(describe(m))
-if m["trades"]:
-    efig = go.Figure(go.Scatter(x=bt_res.equity.index, y=(bt_res.equity - 1) * 100, name="Система", fill="tozeroy"))
-    bh = raw["close"].reindex(bt_res.equity.index)
-    efig.add_trace(go.Scatter(x=bh.index, y=(bh / bh.iloc[0] - 1) * 100, name="Купить и держать",
-                              line=dict(dash="dot", color="gray")))
-    efig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="%",
-                       legend=dict(orientation="h"))
-    st.plotly_chart(efig, width="stretch")
-    with st.expander("Последние сделки"):
-        st.dataframe(bt_res.trades.tail(30).iloc[::-1].round(dict.fromkeys(["Цена входа", "Цена выхода", "Результат %"], 3)), hide_index=True, width="stretch")
-st.caption(f"{len(scores)} свечей истории. Вход по открытию следующей свечи после сигнала, выход по стопу, цели, "
-           "развороту сигнала или времени; при одновременном касании стопа и цели считается стоп. "
-           "Деривативы в бэктесте не участвуют (у Bybit по ним короткая история). Прошлые результаты "
-           "не гарантируют будущих.")
+    with st.expander("Почему такой сигнал"):
+        st.markdown("\n".join(f"- {r}" for r in signal.reasons))
+        st.caption("Направление задают 5m и 15m, сильным сигнал считается только при подтверждении 1h и 1d. "
+                   "Недельный таймфрейм задаёт фон: если он против, сигнал не бывает сильным и уверенность ниже. "
+                   + (f"Уверенность — вероятность пройти {BARRIER_ATR:g} ATR (15m) в сторону сигнала раньше, чем "
+                      "против, по модели, обученной на истории этого актива. " if signal.calibrated else
+                      "Уверенность (истории для модели пока мало): 40% сила консенсуса младших ТФ, 35% "
+                      "подтверждение старшими, 25% недавняя угадываемость. ")
+                   + "Сигнал должен держаться две свечи 15m; уже действующий держится до порога на 10 п.п. ниже."
+                   + (f" Сессия: {SESSION_WORD[asset_key(symbol)]}." if session_filter and asset_key(symbol) in SESSION_WORD
+                      else ""))
 
-st.subheader("Новости")
-if news_err:
-    st.warning(f"Не удалось загрузить новости: {news_err}")
-elif not news:
-    st.info("Новостей не найдено.")
-else:
-    st.write(f"Тон новостей за 3 дня: {ns['score']:+.2f} (позитивных {ns['positive']}, "
-             f"негативных {ns['negative']}, нейтральных {ns['neutral']}).")
-    for n in news[:15]:
-        mark = "🟢" if n.score > 0.1 else "🔴" if n.score < -0.1 else "⚪"
-        st.markdown(f"{mark} [{n.title}]({n.link}) · {n.source} · {n.published:%d.%m %H:%M}")
-    if news_ai_err:
-        st.warning(f"ИИ не оценил новости, показан тон по словарю: {news_ai_err}")
-    if news_mode == "словарь":
-        st.caption("Тон оценивается по словарю финансовых фраз в заголовках, это грубая оценка. "
-                   "Точнее: включите «Тон новостей через ИИ» в боковой панели (нужен ключ ИИ-провайдера).")
-    else:
-        st.caption(f"Тон каждого заголовка оценила модель: {news_mode}. Модель спрашивается не чаще раза "
-                   "в 30 минут на актив; заголовки, появившиеся между запросами, оценены словарём.")
+# Ключевые предупреждения сразу под сигналом.
+if backdrop.elevated:
+    st.warning(f"⚠️ Геополитика: **{backdrop.label}**. Рекомендуемый размер позиции уменьшен до "
+               f"{backdrop.size_mult:.0%} от обычного. " + "; ".join(backdrop.reasons) + ".")
+if signal.direction and _weekly == -signal.direction:
+    st.info(f"📅 Недельный тренд против {DIR_WORD[signal.direction]}а: сделка идёт против крупного движения, "
+            "держите её короче и не наращивайте.")
+if "1w" in errors:
+    st.caption(f"Недельный таймфрейм не учтён: {errors['1w']}. У токенизированных контрактов Bybit "
+               "недельная история короткая, нужно хотя бы 50 недель.")
+if signal.passed and not signal.strong:
+    st.caption("Сигнал не подтверждён всеми старшими таймфреймами, поэтому он обычный, а не сильный.")
 
-st.header("Геополитический фон")
-g1, g2 = st.columns([1, 2])
-with g1:
-    st.metric("Уровень риска", backdrop.label.capitalize(), f"размер позиции {backdrop.size_mult:.0%} от обычного",
-              delta_color="off")
-    if gpr_st:
-        st.metric("Индекс GPR (7 дней)", f"{gpr_st.ma7:.0f}", f"выше {gpr_st.percentile:.0%} дней за год",
-                  delta_color="off")
-    if backdrop.impact:
-        st.caption(f"Типичное влияние событий на {asset}: "
-                   + ("скорее вверх" if backdrop.impact > 0.1 else "скорее вниз" if backdrop.impact < -0.1
-                      else "неопределённое") + f" ({backdrop.impact:+.2f}). В консенсус не входит.")
-with g2:
-    st.markdown("\n".join(f"- {r}" for r in backdrop.reasons))
-    if gpr_series is not None and len(gpr_series):
-        _g = gpr_series[gpr_series.index >= gpr_series.index[-1] - pd.Timedelta(days=365)]
-        gfig = go.Figure(go.Scatter(x=_g.index, y=_g, name="GPR за день", line=dict(width=1, color="#bab0ac")))
-        gfig.add_trace(go.Scatter(x=_g.index, y=_g.rolling(7, min_periods=3).mean(), name="Среднее за 7 дней"))
-        gfig.update_layout(height=220, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
-        st.plotly_chart(gfig, width="stretch")
-_key = asset_key(symbol) or "GOLD"
-_shown = [t for t in geo_tags if t.category != "other"]
-if _shown:
-    with st.expander(f"Геополитические заголовки за 2 дня ({len(_shown)})"):
-        st.dataframe([{"Время": f"{t.published:%d.%m %H:%M}", "Тип": geo.CATEGORY_WORD[t.category],
-                       "Сила": "●" * t.severity or "–", f"Влияние на {asset}": round(t.impact.get(_key, 0.0), 2),
-                       "Заголовок": t.title, "Источник": t.source} for t in _shown[:30]],
+tab_chart, tab_fc, tab_news, tab_ai, tab_more = st.tabs(
+    ["📈 График", "🔮 Прогноз и проверка", "📰 Новости и геополитика", "🤖 ИИ-анализ", "🔍 Подробности"])
+
+with tab_chart:
+    df = ind.add_all(get(symbol, tf)).tail(bars)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(x=df.index, open=df.open, high=df.high, low=df.low, close=df.close, name="Цена"), 1, 1)
+    if "EMA 9/21" in show:
+        fig.add_trace(go.Scatter(x=df.index, y=df.ema9, name="EMA9", line=dict(width=1)), 1, 1)
+        fig.add_trace(go.Scatter(x=df.index, y=df.ema21, name="EMA21", line=dict(width=1)), 1, 1)
+    if "EMA 50/200" in show:
+        fig.add_trace(go.Scatter(x=df.index, y=df.ema50, name="EMA50", line=dict(width=1)), 1, 1)
+        fig.add_trace(go.Scatter(x=df.index, y=df.ema200, name="EMA200", line=dict(width=1)), 1, 1)
+    if "Bollinger" in show:
+        for c in ("bb_up", "bb_low"):
+            fig.add_trace(go.Scatter(x=df.index, y=df[c], name=c, line=dict(width=1, dash="dot", color="gray")), 1, 1)
+    if "Уровни" in show:
+        for y in main.levels["resistance"]:
+            fig.add_hline(y=y, line=dict(color="#e45756", dash="dash", width=1), row=1, col=1)
+        for y in main.levels["support"]:
+            fig.add_hline(y=y, line=dict(color="#54a24b", dash="dash", width=1), row=1, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df["hist"], name="MACD hist",
+                         marker_color=["#54a24b" if v >= 0 else "#e45756" for v in df["hist"]]), 2, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["macd"], name="MACD", line=dict(width=1)), 2, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["signal"], name="Signal", line=dict(width=1)), 2, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=df.rsi, name="RSI"), 3, 1)
+    for y in (30, 70):
+        fig.add_hline(y=y, line=dict(color="gray", dash="dot", width=1), row=3, col=1)
+    fig.update_layout(height=750, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10),
+                      legend=dict(orientation="h"))
+    st.plotly_chart(fig, width="stretch")
+
+with tab_fc:
+    st.caption(f"Прогноз по таймфрейму {tf} и проверка того, как сигналы работали на истории.")
+    f1, f2 = st.columns([1, 2])
+    with f1:
+        st.metric("Прогнозный вердикт", v.label, f"уверенность: {v.confidence}", delta_color="off")
+    with f2:
+        st.markdown("\n".join(f"- {r}" for r in v.reasons))
+
+    st.subheader("Ожидаемый диапазон цены")
+    rng = price_ranges(raw)
+    if rng:
+        st.dataframe([{k: (f"{x:,.2f}" if isinstance(x, float) and k != "Ход ±%" else
+                           f"±{x:.2f}%" if k == "Ход ±%" else x) for k, x in r.items()} for r in rng],
                      hide_index=True, width="stretch")
-for e in geo_err:
-    st.warning(f"Геополитический фон посчитан не полностью, {e}")
-st.caption(f"Разметка новостей: {geo_mode}. Индекс GPR (Caldara & Iacoviello) считает долю статей о "
-           "геополитической напряжённости в ведущих газетах. Фон не голосует в консенсусе: он предупреждает "
-           "о риске и уменьшает рекомендуемый размер позиции (повышенный риск 50%, высокий 25%).")
+        st.caption("Цена с вероятностью около 68% (или 95%) останется в диапазоне, если волатильность "
+                   "будет как в последние дни. Направление этот расчёт не предсказывает.")
 
-st.header("ИИ-анализ")
-ai_slot = f"ai::{symbol}"
-if st.button("Запросить ИИ-анализ", type="primary", disabled=not ai.api_key(),
-             help=None if ai.api_key() else f"Сначала задайте ключ {ai.provider().label} в боковой панели."):
-    ctx = ai.build_context(asset, _contract, results, score, label, verdict=v, ranges=rng, backtests=bts,
-                           news=news, news_sentiment=ns, signal=signal, backdrop=backdrop)
-    with st.spinner("Модель думает, бесплатные модели иногда отвечают до минуты…"):
-        try:
-            st.session_state[ai_slot] = (ai.analyze_with_ai(ctx, model=ai_model), datetime.now())
-        except ai.AIError as e:
-            st.error(str(e))
-if not ai.api_key():
-    st.info(f"Добавьте ключ {ai.provider().label} в боковой панели (раздел «ИИ-анализ»), чтобы модель разобрала актив.")
-if ai_slot in st.session_state:
-    res_ai, when = st.session_state[ai_slot]
-    a1, a2 = st.columns([1, 2])
-    with a1:
-        st.metric("Вывод ИИ", res_ai.direction.capitalize(), f"уверенность: {res_ai.confidence}", delta_color="off")
-        st.caption(f"Модель: {res_ai.model} · {when:%H:%M}")
-    with a2:
-        st.markdown(res_ai.summary)
-        if res_ai.levels:
-            st.markdown(f"**Уровни:** {res_ai.levels}")
-    k1, k2 = st.columns(2)
-    with k1:
-        if res_ai.key_factors:
-            st.markdown("**Ключевые факторы**\n" + "\n".join(f"- {x}" for x in res_ai.key_factors))
-    with k2:
-        if res_ai.risks:
-            st.markdown("**Риски**\n" + "\n".join(f"- {x}" for x in res_ai.risks))
-    st.caption("Модель видит только данные этого дашборда и может ошибаться. Не является инвестиционной рекомендацией.")
+    st.subheader(f"Как сигналы {tf} срабатывали раньше")
+    if bts:
+        st.dataframe([{"Через": name,
+                       "Сигналов лонг": b["long"]["n"], "Лонг угадал": f"{b['long']['hit']:.0%}" if b["long"]["n"] else "–",
+                       "Сигналов шорт": b["short"]["n"], "Шорт угадал": f"{b['short']['hit']:.0%}" if b["short"]["n"] else "–",
+                       "Рост без сигнала": f"{b['base_up']:.0%}"} for name, b in bts.items()],
+                     hide_index=True, width="stretch")
+        st.caption(f"Проверка на последних {len(scores)} свечах. Если «угадал» близко к 50%, сигнал на этом активе "
+                   "сейчас работает не лучше монетки.")
+    else:
+        st.info("Мало истории для проверки сигналов на этом таймфрейме.")
 
-st.header("Разбор по таймфрейму " + tf)
-left, right = st.columns([3, 2])
-with left:
-    st.subheader("Разбор")
-    st.markdown(main.summary)
-    if main.trade:
-        _t = {k: f"{v:,.2f}" for k, v in {"Вход": main.trade["entry"], "Стоп": main.trade["stop"],
-                                            "Цель 1": main.trade["target1"], "Цель 2": main.trade["target2"]}.items()}
-        _t["Прибыль/риск"] = f"{main.trade.get('rr', 0):.1f}" + (" ⚠️" if main.trade.get("rr", 0) < MIN_RR else "")
-        st.table({k: [v] for k, v in _t.items()})
-        st.caption("Стоп ставится за ближайший уровень, если он в 0.75–3 ATR, иначе 1.5 ATR; цели у следующих уровней.")
-        _stop_pct = abs(main.trade["entry"] - main.trade["stop"]) / main.trade["entry"] * 100
-        _risk, _size = geo.position_size(base_risk, _stop_pct, backdrop.size_mult)
-        st.markdown(f"**Размер позиции:** риск {_risk:.2f}% депозита, объём {_size:.0f}% депозита "
-                    f"(стоп в {_stop_pct:.2f}% от входа)"
-                    + (f". Уменьшен до {backdrop.size_mult:.0%} из-за геополитики." if backdrop.elevated else "."))
-        if not signal.passed:
-            st.caption("Итоговый сигнал не прошёл порог уверенности: ориентиры выше только для справки.")
-    st.write("Сопротивления:", ", ".join(f"{x:,.2f}" for x in main.levels["resistance"]) or "нет")
-    st.write("Поддержки:", ", ".join(f"{x:,.2f}" for x in main.levels["support"]) or "нет")
-with right:
-    st.subheader("Голоса индикаторов")
-    st.dataframe(
-        [{"Индикатор": v.name, "Семейство": FAMILY_WORD.get(family_of(v), family_of(v)),
-          "Голос": "лонг" if v.score > 0.1 else "шорт" if v.score < -0.1 else "нейтр.",
-          "Сила": round(v.score, 2), "Почему": v.reason} for v in main.votes],
-        hide_index=True, width="stretch")
-    st.caption("Голоса сначала усредняются внутри семейства, потом семейства между собой, чтобы похожие "
-               "индикаторы не засчитывались несколько раз.")
+    st.subheader("Бэктест итогового сигнала")
+    if history is not None and (history.frame["side"] != 0).any():
+        _base = get(symbol, HIT_TF)
+        with st.expander("Параметры бэктеста итогового сигнала", expanded=False):
+            q1, q2, q3, q4 = st.columns(4)
+            fs_stop = q1.number_input("Стоп, ATR 15m", 0.5, 10.0, 1.5, 0.5, key="fs_stop")
+            fs_target = q2.number_input("Цель, ATR 15m", 0.5, 20.0, 3.0, 0.5, key="fs_target")
+            fs_be = q3.number_input("Безубыток после, R", 0.0, 5.0, 1.0, 0.5, key="fs_be",
+                                    help="Когда цена прошла столько расстояний до стопа, стоп переносится в точку входа. 0 — выкл.")
+            fs_hold = q4.number_input("Держать максимум, свечей 15m", 1, 500, 32, key="fs_hold")
+        fs = simulate_signal(_base, history.frame["side"], BTConfig(
+            fee=BYBIT_TAKER_FEE, slippage=0.0002, stop_atr=fs_stop, target_atr=fs_target, max_bars=int(fs_hold),
+            breakeven_r=fs_be))
+        fm = fs.metrics
+        j1, j2, j3, j4, j5 = st.columns(5)
+        j1.metric("Сделок", fm["trades"], f"лонг {fm['longs']} / шорт {fm['shorts']}", delta_color="off")
+        j2.metric("Прибыльных", f"{fm['win_rate']:.0%}" if fm["trades"] else "–")
+        j3.metric("Profit factor", "–" if not fm["trades"] else "∞" if fm["profit_factor"] == float("inf")
+                  else f"{fm['profit_factor']:.2f}")
+        j4.metric("Итог", f"{fm['total_return']:+.2f}%", f"держать: {fm['buy_hold']:+.2f}%", delta_color="off")
+        j5.metric("Макс. просадка", f"{fm['max_drawdown']:.2f}%")
+        st.markdown(describe(fm))
+        if fm["trades"]:
+            sfig = go.Figure(go.Scatter(x=fs.equity.index, y=(fs.equity - 1) * 100, name="Итоговый сигнал", fill="tozeroy"))
+            sfig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="%")
+            st.plotly_chart(sfig, width="stretch")
+        _h = history.frame
+        _known = _h[(_h["side"] != 0) & _h["outcome"].notna()]
+        st.caption(f"Та же логика, что у живого сигнала (подтверждение старшими ТФ, порог {sig_thr}%, угадываемость, "
+                   "две свечи подряд, сессии), прогнанная по истории 15m без заглядывания в будущее: старшие ТФ "
+                   "берутся только по закрытым свечам, модель уверенности переобучается раз в сутки только на "
+                   f"прошлых сигналах. История: {len(_h)} свечей 15m с {_h.index[0]:%d.%m.%Y}"
+                   + (f", из них с сигналом {len(_known)}, до цели раньше стопа {_known['outcome'].mean():.0%}"
+                      if len(_known) else "")
+                   + ". Комиссия тейкера Bybit и проскальзывание учтены. Деривативы, связка металлов и фильтр "
+                     "прибыль/риск в историю не входят.")
+    elif history is not None:
+        st.info("На истории итоговый сигнал ни разу не прошёл все фильтры: проверять нечего. "
+                "Можно снизить порог уверенности в боковой панели.")
+    else:
+        st.info("Мало истории 15m для бэктеста итогового сигнала.")
 
-if errors:
-    st.caption("Не загрузились таймфреймы: " + ", ".join(errors))
+    st.subheader(f"Бэктест консенсуса {tf} как торговой системы")
+    with st.expander("Параметры бэктеста", expanded=False):
+        b1, b2, b3, b4 = st.columns(4)
+        bt_fee = b1.number_input("Комиссия за сторону, %", 0.0, 1.0, BYBIT_TAKER_FEE * 100, 0.005, format="%.3f",
+                                 help="Тейкер на фьючерсах Bybit 0.055%, мейкер 0.02%.")
+        bt_slip = b2.number_input("Проскальзывание за сторону, %", 0.0, 1.0, 0.02, 0.005, format="%.3f")
+        bt_thr = b3.slider("Порог сигнала", 0.05, 0.6, 0.15, 0.05,
+                           help="Балл консенсуса, от которого открывается сделка (0.15 = «Лонг»/«Шорт»).")
+        bt_hold = b4.number_input("Держать максимум, свечей", 1, 500, max(horizon_bars(raw, 240), 8))
+        b5, b6, b7, b8 = st.columns(4)
+        bt_stop = b5.number_input("Стоп, ATR", 0.5, 10.0, 1.5, 0.5)
+        bt_target = b6.number_input("Цель, ATR", 0.5, 20.0, 3.0, 0.5)
+        bt_flip = b7.checkbox("Выход при развороте сигнала", value=True)
+        bt_short = b8.checkbox("Разрешить шорты", value=True)
+        b9, b10, _, _ = st.columns(4)
+        bt_be = b9.number_input("Безубыток после, R", 0.0, 5.0, 0.0, 0.5, help="0 — выкл.")
+        bt_confirm = b10.number_input("Сигнал держится, свечей", 1, 5, 1)
+    bt_res = simulate(raw, scores, BTConfig(threshold=bt_thr, fee=bt_fee / 100, slippage=bt_slip / 100,
+                                            stop_atr=bt_stop, target_atr=bt_target, max_bars=int(bt_hold),
+                                            exit_on_flip=bt_flip, allow_short=bt_short, breakeven_r=bt_be,
+                                            confirm_bars=int(bt_confirm)))
+    m = bt_res.metrics
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Сделок", m["trades"], f"лонг {m['longs']} / шорт {m['shorts']}", delta_color="off")
+    k2.metric("Прибыльных", f"{m['win_rate']:.0%}" if m["trades"] else "–")
+    k3.metric("Profit factor", "–" if not m["trades"] else "∞" if m["profit_factor"] == float("inf")
+              else f"{m['profit_factor']:.2f}")
+    k4.metric("Итог", f"{m['total_return']:+.2f}%", f"держать: {m['buy_hold']:+.2f}%", delta_color="off")
+    k5.metric("Макс. просадка", f"{m['max_drawdown']:.2f}%")
+    st.markdown(describe(m))
+    if m["trades"]:
+        efig = go.Figure(go.Scatter(x=bt_res.equity.index, y=(bt_res.equity - 1) * 100, name="Система", fill="tozeroy"))
+        bh = raw["close"].reindex(bt_res.equity.index)
+        efig.add_trace(go.Scatter(x=bh.index, y=(bh / bh.iloc[0] - 1) * 100, name="Купить и держать",
+                                  line=dict(dash="dot", color="gray")))
+        efig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="%",
+                           legend=dict(orientation="h"))
+        st.plotly_chart(efig, width="stretch")
+        with st.expander("Последние сделки"):
+            st.dataframe(bt_res.trades.tail(30).iloc[::-1].round(dict.fromkeys(["Цена входа", "Цена выхода", "Результат %"], 3)), hide_index=True, width="stretch")
+    st.caption(f"{len(scores)} свечей истории. Вход по открытию следующей свечи после сигнала, выход по стопу, цели, "
+               "развороту сигнала или времени; при одновременном касании стопа и цели считается стоп. "
+               "Деривативы в бэктесте не участвуют (у Bybit по ним короткая история). Прошлые результаты "
+               "не гарантируют будущих.")
+
+with tab_news:
+    st.subheader("Новости")
+    if news_err:
+        st.warning(f"Не удалось загрузить новости: {news_err}")
+    elif not news:
+        st.info("Новостей не найдено.")
+    else:
+        st.write(f"Тон новостей за 3 дня: {ns['score']:+.2f} (позитивных {ns['positive']}, "
+                 f"негативных {ns['negative']}, нейтральных {ns['neutral']}).")
+        for n in news[:15]:
+            mark = "🟢" if n.score > 0.1 else "🔴" if n.score < -0.1 else "⚪"
+            st.markdown(f"{mark} [{n.title}]({n.link}) · {n.source} · {n.published:%d.%m %H:%M}")
+        if news_ai_err:
+            st.warning(f"ИИ не оценил новости, показан тон по словарю: {news_ai_err}")
+        if news_mode == "словарь":
+            st.caption("Тон оценивается по словарю финансовых фраз в заголовках, это грубая оценка. "
+                       "Точнее: включите «Тон новостей через ИИ» в боковой панели (нужен ключ ИИ-провайдера).")
+        else:
+            st.caption(f"Тон каждого заголовка оценила модель: {news_mode}. Модель спрашивается не чаще раза "
+                       "в 30 минут на актив; заголовки, появившиеся между запросами, оценены словарём.")
+
+    st.subheader("Геополитический фон")
+    g1, g2 = st.columns([1, 2])
+    with g1:
+        st.metric("Уровень риска", backdrop.label.capitalize(), f"размер позиции {backdrop.size_mult:.0%} от обычного",
+                  delta_color="off")
+        if gpr_st:
+            st.metric("Индекс GPR (7 дней)", f"{gpr_st.ma7:.0f}", f"выше {gpr_st.percentile:.0%} дней за год",
+                      delta_color="off")
+        if backdrop.impact:
+            st.caption(f"Типичное влияние событий на {asset}: "
+                       + ("скорее вверх" if backdrop.impact > 0.1 else "скорее вниз" if backdrop.impact < -0.1
+                          else "неопределённое") + f" ({backdrop.impact:+.2f}). В консенсус не входит.")
+    with g2:
+        st.markdown("\n".join(f"- {r}" for r in backdrop.reasons))
+        if gpr_series is not None and len(gpr_series):
+            _g = gpr_series[gpr_series.index >= gpr_series.index[-1] - pd.Timedelta(days=365)]
+            gfig = go.Figure(go.Scatter(x=_g.index, y=_g, name="GPR за день", line=dict(width=1, color="#bab0ac")))
+            gfig.add_trace(go.Scatter(x=_g.index, y=_g.rolling(7, min_periods=3).mean(), name="Среднее за 7 дней"))
+            gfig.update_layout(height=220, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
+            st.plotly_chart(gfig, width="stretch")
+    _key = asset_key(symbol) or "GOLD"
+    _shown = [t for t in geo_tags if t.category != "other"]
+    if _shown:
+        with st.expander(f"Геополитические заголовки за 2 дня ({len(_shown)})"):
+            st.dataframe([{"Время": f"{t.published:%d.%m %H:%M}", "Тип": geo.CATEGORY_WORD[t.category],
+                           "Сила": "●" * t.severity or "–", f"Влияние на {asset}": round(t.impact.get(_key, 0.0), 2),
+                           "Заголовок": t.title, "Источник": t.source} for t in _shown[:30]],
+                         hide_index=True, width="stretch")
+    for e in geo_err:
+        st.warning(f"Геополитический фон посчитан не полностью, {e}")
+    st.caption(f"Разметка новостей: {geo_mode}. Индекс GPR (Caldara & Iacoviello) считает долю статей о "
+               "геополитической напряжённости в ведущих газетах. Фон не голосует в консенсусе: он предупреждает "
+               "о риске и уменьшает рекомендуемый размер позиции (повышенный риск 50%, высокий 25%).")
+
+with tab_ai:
+    ai_slot = f"ai::{symbol}"
+    if st.button("Запросить ИИ-анализ", type="primary", disabled=not ai.api_key(),
+                 help=None if ai.api_key() else f"Сначала задайте ключ {ai.provider().label} в боковой панели."):
+        ctx = ai.build_context(asset, _contract, results, score, label, verdict=v, ranges=rng, backtests=bts,
+                               news=news, news_sentiment=ns, signal=signal, backdrop=backdrop)
+        with st.spinner("Модель думает, бесплатные модели иногда отвечают до минуты…"):
+            try:
+                st.session_state[ai_slot] = (ai.analyze_with_ai(ctx, model=ai_model), datetime.now())
+            except ai.AIError as e:
+                st.error(str(e))
+    if not ai.api_key():
+        st.info(f"Добавьте ключ {ai.provider().label} в боковой панели (раздел «ИИ-анализ»), чтобы модель разобрала актив.")
+    if ai_slot in st.session_state:
+        res_ai, when = st.session_state[ai_slot]
+        a1, a2 = st.columns([1, 2])
+        with a1:
+            st.metric("Вывод ИИ", res_ai.direction.capitalize(), f"уверенность: {res_ai.confidence}", delta_color="off")
+            st.caption(f"Модель: {res_ai.model} · {when:%H:%M}")
+        with a2:
+            st.markdown(res_ai.summary)
+            if res_ai.levels:
+                st.markdown(f"**Уровни:** {res_ai.levels}")
+        k1, k2 = st.columns(2)
+        with k1:
+            if res_ai.key_factors:
+                st.markdown("**Ключевые факторы**\n" + "\n".join(f"- {x}" for x in res_ai.key_factors))
+        with k2:
+            if res_ai.risks:
+                st.markdown("**Риски**\n" + "\n".join(f"- {x}" for x in res_ai.risks))
+        st.caption("Модель видит только данные этого дашборда и может ошибаться. Не является инвестиционной рекомендацией.")
+
+with tab_more:
+    st.subheader("Консенсус по таймфреймам")
+    cols = st.columns(len(results))
+    for col, (t, r) in zip(cols, results.items()):
+        with col:
+            g = go.Figure(go.Indicator(
+                mode="gauge+number", value=r.long_pct, number={"suffix": "%"},
+                title={"text": f"{t}: {r.label}" + (f"<br><span style='font-size:0.7em'>{r.regime.label}</span>"
+                                                           if r.regime else "")},
+                gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#444"},
+                       "steps": [{"range": [0, 42.5], "color": "#e45756"},
+                                 {"range": [42.5, 57.5], "color": "#bab0ac"},
+                                 {"range": [57.5, 100], "color": "#54a24b"}]}))
+            g.update_layout(height=200, margin=dict(l=10, r=10, t=50, b=0))
+            st.plotly_chart(g, width="stretch")
+    st.subheader("Разбор по таймфрейму " + tf)
+    left, right = st.columns([3, 2])
+    with left:
+        st.subheader("Разбор")
+        st.markdown(main.summary)
+        if main.trade:
+            _t = {k: f"{v:,.2f}" for k, v in {"Вход": main.trade["entry"], "Стоп": main.trade["stop"],
+                                                "Цель 1": main.trade["target1"], "Цель 2": main.trade["target2"]}.items()}
+            _t["Прибыль/риск"] = f"{main.trade.get('rr', 0):.1f}" + (" ⚠️" if main.trade.get("rr", 0) < MIN_RR else "")
+            st.table({k: [v] for k, v in _t.items()})
+            st.caption("Стоп ставится за ближайший уровень, если он в 0.75–3 ATR, иначе 1.5 ATR; цели у следующих уровней.")
+            _stop_pct = abs(main.trade["entry"] - main.trade["stop"]) / main.trade["entry"] * 100
+            _risk, _size = geo.position_size(base_risk, _stop_pct, backdrop.size_mult)
+            st.markdown(f"**Размер позиции:** риск {_risk:.2f}% депозита, объём {_size:.0f}% депозита "
+                        f"(стоп в {_stop_pct:.2f}% от входа)"
+                        + (f". Уменьшен до {backdrop.size_mult:.0%} из-за геополитики." if backdrop.elevated else "."))
+            if not signal.passed:
+                st.caption("Итоговый сигнал не прошёл порог уверенности: ориентиры выше только для справки.")
+        st.write("Сопротивления:", ", ".join(f"{x:,.2f}" for x in main.levels["resistance"]) or "нет")
+        st.write("Поддержки:", ", ".join(f"{x:,.2f}" for x in main.levels["support"]) or "нет")
+    with right:
+        st.subheader("Голоса индикаторов")
+        st.dataframe(
+            [{"Индикатор": v.name, "Семейство": FAMILY_WORD.get(family_of(v), family_of(v)),
+              "Голос": "лонг" if v.score > 0.1 else "шорт" if v.score < -0.1 else "нейтр.",
+              "Сила": round(v.score, 2), "Почему": v.reason} for v in main.votes],
+            hide_index=True, width="stretch")
+        st.caption("Голоса сначала усредняются внутри семейства, потом семейства между собой, чтобы похожие "
+                   "индикаторы не засчитывались несколько раз.")
+
+
+    d_main = derivs.get(tf)
+    if use_deriv and (d_main is not None or deriv_err):
+        st.subheader("Деривативы Bybit")
+        if deriv_err:
+            st.warning(f"Не удалось загрузить данные деривативов: {deriv_err}")
+        if d_main is not None:
+            d1, d2, d3 = st.columns(3)
+            if d_main.funding is not None:
+                d1.metric("Funding (за 8 ч)", f"{d_main.funding * 100:+.4f}%",
+                          f"среднее {d_main.funding_avg * 100:+.4f}%" if d_main.funding_avg is not None else None,
+                          delta_color="off")
+            if len(d_main.oi):
+                oi_ch = d_main.oi.iloc[-1] / d_main.oi.iloc[0] - 1 if d_main.oi.iloc[0] else 0.0
+                d2.metric("Открытый интерес", f"{d_main.oi.iloc[-1]:,.0f}", f"{oi_ch * 100:+.1f}% за {len(d_main.oi)} периодов")
+            if len(d_main.buy_ratio):
+                d3.metric("Аккаунтов в лонге", f"{d_main.buy_ratio.iloc[-1]:.0%}",
+                          f"в шорте {1 - d_main.buy_ratio.iloc[-1]:.0%}", delta_color="off")
+            dfig = make_subplots(specs=[[{"secondary_y": True}]])
+            if len(d_main.oi):
+                dfig.add_trace(go.Scatter(x=d_main.oi.index, y=d_main.oi, name="Открытый интерес"), secondary_y=False)
+            if len(d_main.buy_ratio):
+                dfig.add_trace(go.Scatter(x=d_main.buy_ratio.index, y=d_main.buy_ratio * 100, name="% аккаунтов в лонге",
+                                          line=dict(dash="dot")), secondary_y=True)
+            dfig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
+            st.plotly_chart(dfig, width="stretch")
+            st.caption("Высокий funding и сильный перекос аккаунтов в одну сторону голосуют против толпы. "
+                       "Рост открытого интереса вместе с ценой подтверждает движение.")
+    elif use_deriv and symbol.startswith("BYBIT:"):
+        st.caption("Для этого инструмента Bybit не публикует funding и открытый интерес (это спот-токен).")
+    if errors:
+        st.caption("Не загрузились таймфреймы: " + "; ".join(f"{k} ({e})" for k, e in errors.items()))
