@@ -5,6 +5,9 @@
 - вход по открытию следующей свечи, чтобы не подглядывать в будущее;
 - выход по стопу или цели в ATR от цены входа, по противоположному сигналу или по истечении max_bars;
 - если на одной свече задеты и стоп, и цель, считаем, что сработал стоп (осторожная оценка);
+- breakeven_r: когда цена прошла столько R (R = расстояние до стопа) в нашу сторону, со следующей
+  свечи стоп переносится в точку входа;
+- confirm_bars: сигнал должен держаться столько закрытых свечей подряд, прежде чем открыть сделку;
 - если цена открылась за стопом или целью (гэп), исполнение по цене открытия;
 - комиссия и проскальзывание списываются на входе и на выходе, без плеча, весь капитал в сделке.
 
@@ -32,6 +35,8 @@ class BTConfig:
     max_bars: int = 32             # сколько свечей держать позицию максимум
     exit_on_flip: bool = True      # выходить при противоположном сигнале
     allow_short: bool = True
+    breakeven_r: float = 0.0       # 0 — без переноса стопа в безубыток
+    confirm_bars: int = 1          # 2 — сигнал должен держаться две свечи подряд
 
 
 @dataclass
@@ -66,7 +71,14 @@ def simulate(df: pd.DataFrame, scores: pd.Series, cfg: BTConfig | None = None) -
     pos = 0          # +1 лонг, -1 шорт, 0 вне рынка
     entry = stop = target = 0.0
     entry_i = 0
+    risk = 0.0
+    be_done = False
     pending = 0      # направление входа, который исполнится на открытии следующей свечи
+    sides = np.array([_side(x, cfg) for x in s])
+    streak = np.ones(n, dtype=int)
+    for i in range(1, n):
+        if sides[i] and sides[i] == sides[i - 1]:
+            streak[i] = streak[i - 1] + 1
 
     def close_trade(i: int, price: float, why: str) -> None:
         nonlocal cash, pos
@@ -85,6 +97,7 @@ def simulate(df: pd.DataFrame, scores: pd.Series, cfg: BTConfig | None = None) -
             entry = o[i] * (1 + pos * cfg.slippage)
             atr_i = a[i - 1] if i else a[i]
             stop, target = entry - pos * cfg.stop_atr * atr_i, entry + pos * cfg.target_atr * atr_i
+            risk, be_done = abs(entry - stop), False
             entry_i = i
         pending = 0
 
@@ -100,11 +113,14 @@ def simulate(df: pd.DataFrame, scores: pd.Series, cfg: BTConfig | None = None) -
                 close_trade(i, target, "цель")
             elif i - entry_i + 1 >= cfg.max_bars:
                 close_trade(i, c[i], "время")
-            elif cfg.exit_on_flip and _side(s[i], cfg) == -pos:
+            elif cfg.exit_on_flip and sides[i] == -pos:
                 close_trade(i, c[i], "разворот сигнала")
+            elif cfg.breakeven_r > 0 and not be_done and \
+                    pos * ((h[i] if pos > 0 else l[i]) - entry) >= cfg.breakeven_r * risk:
+                stop, be_done = entry, True  # действует со следующей свечи
 
-        if pos == 0 and i < n - 1:
-            pending = _side(s[i], cfg)
+        if pos == 0 and i < n - 1 and streak[i] >= cfg.confirm_bars:
+            pending = sides[i]
 
         # Капитал по закрытию свечи, с учётом открытой позиции и будущей комиссии на выход.
         if pos:
@@ -120,6 +136,14 @@ def simulate(df: pd.DataFrame, scores: pd.Series, cfg: BTConfig | None = None) -
     eq = pd.Series(equity, index=idx, name="Капитал")
     tr = pd.DataFrame(trades)
     return BTResult(cfg, tr, eq, metrics(tr, eq, d["close"]))
+
+
+def simulate_signal(base: pd.DataFrame, side: pd.Series, cfg: BTConfig | None = None) -> BTResult:
+    """Бэктест итогового сигнала: side — итоговая сторона (+1, -1, 0) на каждой свече base (15m)
+    из signals.signal_history. Подтверждение двумя свечами уже учтено в самой истории сигнала."""
+    cfg = cfg or BTConfig(breakeven_r=1.0)
+    cfg = BTConfig(**{**asdict(cfg), "threshold": 0.5, "confirm_bars": 1})
+    return simulate(base, side.astype(float), cfg)
 
 
 def metrics(trades: pd.DataFrame, equity: pd.Series, close: pd.Series) -> dict:

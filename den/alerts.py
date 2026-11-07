@@ -91,10 +91,13 @@ def chat_ids(token: str | None = None) -> list[tuple[str, str]]:
 
 
 def analyze_symbol(symbol: str, use_deriv: bool = True,
-                   frames: dict | None = None) -> tuple[dict[str, Analysis], float, str]:
-    """Тот же расчёт, что в дашборде: консенсус по всем таймфреймам, с деривативами Bybit.
-    Если передан словарь frames, в него складываются загруженные свечи по таймфреймам."""
+                   frames: dict | None = None, use_cross: bool = True) -> tuple[dict[str, Analysis], float, str]:
+    """Тот же расчёт, что в дашборде: консенсус по всем таймфреймам, с деривативами Bybit и связкой
+    золото–серебро. Если передан словарь frames, в него складываются загруженные свечи по таймфреймам."""
+    from .cross import cross_votes, partner
+
     results = {}
+    other = partner(symbol) if use_cross else None
     for tf in TIMEFRAMES:
         try:
             df = load_ohlcv(symbol, tf)
@@ -106,6 +109,11 @@ def analyze_symbol(symbol: str, use_deriv: bool = True,
         if use_deriv and symbol.startswith("BYBIT:"):
             try:
                 extra = derivative_votes(load_derivatives(symbol[6:], tf), df["close"])
+            except Exception:  # noqa: BLE001
+                pass
+        if other:
+            try:
+                extra += cross_votes(symbol, df, load_ohlcv(other, tf))
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -267,7 +275,10 @@ def check_once(send=send_telegram, log=print, cfg: AlertConfig | None = None) ->
             log(f"{sym}: ошибка, {e}")
             continue
         try:
-            sig = evaluate(results, frames.get(HIT_TF), threshold=cfg.threshold, min_hit=cfg.min_hit)
+            from .news import asset_key
+
+            sig = evaluate(results, frames.get(HIT_TF), threshold=cfg.threshold, min_hit=cfg.min_hit,
+                           frames=frames, asset=asset_key(sym))
         except Exception:  # noqa: BLE001
             sig = None
         cur = snapshot(results, score, label, cfg.agree_tfs, sig)

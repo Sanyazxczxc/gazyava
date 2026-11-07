@@ -35,20 +35,20 @@ def test_confirmation_statuses():
 
 
 def test_strong_signal_only_when_confirmed():
-    sig = evaluate(_results({"5m": .8, "15m": .8, "1h": .8, "1d": .8}), make(0.8, seed=1))
+    sig = evaluate(_results({"5m": .8, "15m": .8, "1h": .8, "1d": .8}), make(0.8, seed=1), check_rr=False)
     assert sig.passed and sig.strong and sig.label == "Сильный лонг" and sig.confidence >= 70
-    sig = evaluate(_results({"5m": .8, "15m": .8, "1h": .8, "1d": -.8}), make(0.8, seed=1))
+    sig = evaluate(_results({"5m": .8, "15m": .8, "1h": .8, "1d": -.8}), make(0.8, seed=1), check_rr=False)
     assert not sig.passed and sig.label == "Нет сигнала"
 
 
 def test_threshold_and_hit_rate_block():
     res = _results({"5m": .8, "15m": .8, "1h": .8, "1d": .8})
-    assert final_signal(res, (0.9, 50), threshold=70).passed
-    assert not final_signal(res, (0.9, 50), threshold=101).passed
-    low = final_signal(res, (0.45, 50), threshold=50, min_hit=0.55)
+    assert final_signal(res, (0.9, 50), threshold=70, check_rr=False).passed
+    assert not final_signal(res, (0.9, 50), threshold=101, check_rr=False).passed
+    low = final_signal(res, (0.45, 50), threshold=50, min_hit=0.55, check_rr=False)
     assert not low.passed and any("ниже минимума" in r for r in low.reasons)
     # Мало истории: угадываемость не блокирует, но и не добавляет уверенности.
-    assert final_signal(res, (0.2, 3), threshold=50).passed
+    assert final_signal(res, (0.2, 3), threshold=50, check_rr=False).passed
 
 
 def test_recent_hit_rate_counts_last_signals():

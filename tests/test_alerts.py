@@ -129,7 +129,7 @@ def test_signal_event_and_message():
     from den.signals import evaluate
 
     cur, res = _snap({"5m": 0.8, "15m": 0.8, "1h": 0.8, "1d": 0.8})
-    sig = evaluate(res, make(0.8, seed=1))
+    sig = evaluate(res, make(0.8, seed=1), check_rr=False)
     score, label = cur["score"], cur["label"]
     snap = alerts.snapshot(res, score, label, ["5m", "15m", "1h"], sig)
     assert snap["signal"] == 1 and "подтверждён" in snap["confirm"]

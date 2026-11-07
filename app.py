@@ -11,13 +11,15 @@ from plotly.subplots import make_subplots
 
 from den import ai, alerts, geo
 from den import indicators as ind
-from den.analysis import analyze, multi_timeframe
-from den.backtest import BYBIT_TAKER_FEE, BTConfig, describe, simulate
+from den.analysis import FAMILY_WORD, MIN_RR, analyze, family_of, multi_timeframe
+from den.backtest import BYBIT_TAKER_FEE, BTConfig, describe, simulate, simulate_signal
+from den.cross import cross_votes, partner
 from den.derivatives import derivative_votes, load_derivatives
 from den.data import ASSETS, TIMEFRAMES, load_ohlcv
 from den.forecast import HORIZONS, backtest, horizon_bars, price_ranges, score_series, verdict
 from den.news import asset_key, fetch_news, sentiment
-from den.signals import DEFAULT_MIN_HIT, DEFAULT_THRESHOLD, HIT_TF, evaluate
+from den.sessions import SESSION_WORD
+from den.signals import BARRIER_ATR, DEFAULT_MIN_HIT, DEFAULT_THRESHOLD, HIT_TF, evaluate, signal_history
 
 st.set_page_config(page_title="DEN: анализ рынка", layout="wide")
 
@@ -53,6 +55,19 @@ def get_ai_news(symbol: str, model: str, items: list):
 def get_scores(symbol: str, tf: str, use_regime: bool = True):
     raw = get(symbol, tf)
     return score_series(raw, last_n=len(raw), use_regime=use_regime)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_history(symbol: str, use_regime: bool, threshold: float, min_hit: float, session_filter: bool):
+    frames = {}
+    for t in TIMEFRAMES:
+        try:
+            frames[t] = get(symbol, t)
+        except Exception:  # noqa: BLE001
+            pass
+    if HIT_TF not in frames or len(frames[HIT_TF]) <= 120:
+        return None
+    return signal_history(frames, use_regime, asset_key(symbol), threshold, min_hit, session_filter)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -106,7 +121,15 @@ with st.sidebar:
                             help="Ниже порога дашборд показывает «нет сигнала».")
         sig_hit = st.slider("Мин. угадываемость на истории, %", 50, 70, int(DEFAULT_MIN_HIT * 100), 1,
                             help=f"Доля недавних сигналов той же стороны на {HIT_TF}, после которых цена "
-                                 "через 4 часа ушла в их сторону.") / 100
+                                 f"прошла {BARRIER_ATR:g} ATR в их сторону раньше, чем против (за 4 часа, "
+                                 "с комиссиями).") / 100
+        session_filter = st.checkbox("Только в основную сессию", value=True,
+                                     help="Металлы: Лондон 08:00 – Нью-Йорк 17:00, Apple: биржа США 09:30–16:00 "
+                                          "по Нью-Йорку, по будням. Ночью и в выходные токены торгуются на тонком "
+                                          "рынке, и сигнал не выдаётся.")
+        rr_filter = st.checkbox(f"Прибыль/риск не хуже 1:{MIN_RR:g}", value=True,
+                                help="Сигнал не выдаётся, если до ближайшего уровня на пути меньше "
+                                     f"{MIN_RR:g} расстояний до стопа.")
         base_risk = st.number_input("Риск на сделку, % депозита", 0.1, 5.0, 1.0, 0.1,
                                     help="Сколько депозита теряется при срабатывании стопа. При повышенном "
                                          "геополитическом риске рекомендуемый риск уменьшается.")
@@ -163,12 +186,16 @@ with st.sidebar:
     use_deriv = st.checkbox("Учитывать деривативы Bybit", value=True,
                             help="Funding, открытый интерес и соотношение лонг/шорт добавляются в консенсус "
                                  "как отдельные голоса. Есть только у фьючерсов Bybit.")
+    use_cross = st.checkbox("Связка золото–серебро", value=True,
+                            help="Для металлов в консенсус добавляются консенсус второго металла и "
+                                 "отклонение соотношения их цен от среднего.")
     if st.button("Обновить данные"):
         st.cache_data.clear()
     st.caption("Данные: Bybit, Twelve Data (ключ в DEN_TWELVEDATA_KEY) и Yahoo Finance "
                "(прокси в DEN_PROXY). Не является инвестиционной рекомендацией.")
 
-results, errors, derivs, deriv_err = {}, {}, {}, None
+results, errors, derivs, deriv_err, frames = {}, {}, {}, None, {}
+_partner = partner(symbol) if use_cross else None
 with st.spinner("Загружаю данные…"):
     for t in TIMEFRAMES:
         try:
@@ -176,6 +203,7 @@ with st.spinner("Загружаю данные…"):
         except Exception as e:  # noqa: BLE001
             errors[t] = str(e)
             continue
+        frames[t] = candles
         extra = []
         if use_deriv:
             try:
@@ -183,6 +211,11 @@ with st.spinner("Загружаю данные…"):
                 extra = derivative_votes(derivs[t], candles["close"])
             except Exception as e:  # noqa: BLE001
                 deriv_err = str(e)
+        if _partner:
+            try:
+                extra = extra + cross_votes(symbol, candles, get(_partner, t), use_regime)
+            except Exception:  # noqa: BLE001  второй металл не загрузился: считаем без него
+                pass
         try:
             results[t] = analyze(candles, symbol, t, extra_votes=extra, use_regime=use_regime)
         except Exception as e:  # noqa: BLE001
@@ -194,11 +227,13 @@ if tf not in results:
 
 main = results[tf]
 score, label = multi_timeframe(results)
+history = None
 try:
-    _c15 = get(symbol, HIT_TF)
-    signal = evaluate(results, _c15, get_scores(symbol, HIT_TF, use_regime), threshold=sig_thr, min_hit=sig_hit)
-except Exception:  # noqa: BLE001  15m не загрузился
-    signal = evaluate(results, None, threshold=sig_thr, min_hit=sig_hit)
+    history = get_history(symbol, use_regime, float(sig_thr), float(sig_hit), session_filter)
+except Exception:  # noqa: BLE001  история не посчиталась: сигнал по упрощённой схеме
+    pass
+signal = evaluate(results, frames.get(HIT_TF), threshold=sig_thr, min_hit=sig_hit, use_regime=use_regime,
+                  history=history, asset=asset_key(symbol), session_filter=session_filter, check_rr=rr_filter)
 
 # Геополитический фон: не голос, а предупреждение и множитель размера позиции.
 geo_err, geo_mode, gpr_series, gpr_st, geo_tags = [], "словарь", None, None, []
@@ -256,8 +291,13 @@ with s1:
 with s2:
     st.markdown("\n".join(f"- {r}" for r in signal.reasons))
     st.caption("Направление задают 5m и 15m, сильным сигнал считается только при подтверждении 1h и 1d. "
-               "Уверенность: 40% сила консенсуса младших ТФ, 35% подтверждение старшими, "
-               "25% недавняя угадываемость.")
+               + (f"Уверенность — вероятность пройти {BARRIER_ATR:g} ATR (15m) в сторону сигнала раньше, чем "
+                  "против, по модели, обученной на истории этого актива. " if signal.calibrated else
+                  "Уверенность (истории для модели пока мало): 40% сила консенсуса младших ТФ, 35% "
+                  "подтверждение старшими, 25% недавняя угадываемость. ")
+               + "Сигнал должен держаться две свечи 15m; уже действующий держится до порога на 10 п.п. ниже."
+               + (f" Сессия: {SESSION_WORD[asset_key(symbol)]}." if session_filter and asset_key(symbol) in SESSION_WORD
+                  else ""))
 
 # Консенсус по таймфреймам
 cols = st.columns(len(results))
@@ -387,6 +427,48 @@ if bts:
 else:
     st.info("Мало истории для проверки сигналов на этом таймфрейме.")
 
+st.subheader("Бэктест итогового сигнала")
+if history is not None and (history.frame["side"] != 0).any():
+    _base = get(symbol, HIT_TF)
+    with st.expander("Параметры бэктеста итогового сигнала", expanded=False):
+        q1, q2, q3, q4 = st.columns(4)
+        fs_stop = q1.number_input("Стоп, ATR 15m", 0.5, 10.0, 1.5, 0.5, key="fs_stop")
+        fs_target = q2.number_input("Цель, ATR 15m", 0.5, 20.0, 3.0, 0.5, key="fs_target")
+        fs_be = q3.number_input("Безубыток после, R", 0.0, 5.0, 1.0, 0.5, key="fs_be",
+                                help="Когда цена прошла столько расстояний до стопа, стоп переносится в точку входа. 0 — выкл.")
+        fs_hold = q4.number_input("Держать максимум, свечей 15m", 1, 500, 32, key="fs_hold")
+    fs = simulate_signal(_base, history.frame["side"], BTConfig(
+        fee=BYBIT_TAKER_FEE, slippage=0.0002, stop_atr=fs_stop, target_atr=fs_target, max_bars=int(fs_hold),
+        breakeven_r=fs_be))
+    fm = fs.metrics
+    j1, j2, j3, j4, j5 = st.columns(5)
+    j1.metric("Сделок", fm["trades"], f"лонг {fm['longs']} / шорт {fm['shorts']}", delta_color="off")
+    j2.metric("Прибыльных", f"{fm['win_rate']:.0%}" if fm["trades"] else "–")
+    j3.metric("Profit factor", "–" if not fm["trades"] else "∞" if fm["profit_factor"] == float("inf")
+              else f"{fm['profit_factor']:.2f}")
+    j4.metric("Итог", f"{fm['total_return']:+.2f}%", f"держать: {fm['buy_hold']:+.2f}%", delta_color="off")
+    j5.metric("Макс. просадка", f"{fm['max_drawdown']:.2f}%")
+    st.markdown(describe(fm))
+    if fm["trades"]:
+        sfig = go.Figure(go.Scatter(x=fs.equity.index, y=(fs.equity - 1) * 100, name="Итоговый сигнал", fill="tozeroy"))
+        sfig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="%")
+        st.plotly_chart(sfig, width="stretch")
+    _h = history.frame
+    _known = _h[(_h["side"] != 0) & _h["outcome"].notna()]
+    st.caption(f"Та же логика, что у живого сигнала (подтверждение старшими ТФ, порог {sig_thr}%, угадываемость, "
+               "две свечи подряд, сессии), прогнанная по истории 15m без заглядывания в будущее: старшие ТФ "
+               "берутся только по закрытым свечам, модель уверенности переобучается раз в сутки только на "
+               f"прошлых сигналах. История: {len(_h)} свечей 15m с {_h.index[0]:%d.%m.%Y}"
+               + (f", из них с сигналом {len(_known)}, до цели раньше стопа {_known['outcome'].mean():.0%}"
+                  if len(_known) else "")
+               + ". Комиссия тейкера Bybit и проскальзывание учтены. Деривативы, связка металлов и фильтр "
+                 "прибыль/риск в историю не входят.")
+elif history is not None:
+    st.info("На истории итоговый сигнал ни разу не прошёл все фильтры: проверять нечего. "
+            "Можно снизить порог уверенности в боковой панели.")
+else:
+    st.info("Мало истории 15m для бэктеста итогового сигнала.")
+
 st.subheader(f"Бэктест консенсуса {tf} как торговой системы")
 with st.expander("Параметры бэктеста", expanded=False):
     b1, b2, b3, b4 = st.columns(4)
@@ -401,9 +483,13 @@ with st.expander("Параметры бэктеста", expanded=False):
     bt_target = b6.number_input("Цель, ATR", 0.5, 20.0, 3.0, 0.5)
     bt_flip = b7.checkbox("Выход при развороте сигнала", value=True)
     bt_short = b8.checkbox("Разрешить шорты", value=True)
+    b9, b10, _, _ = st.columns(4)
+    bt_be = b9.number_input("Безубыток после, R", 0.0, 5.0, 0.0, 0.5, help="0 — выкл.")
+    bt_confirm = b10.number_input("Сигнал держится, свечей", 1, 5, 1)
 bt_res = simulate(raw, scores, BTConfig(threshold=bt_thr, fee=bt_fee / 100, slippage=bt_slip / 100,
                                         stop_atr=bt_stop, target_atr=bt_target, max_bars=int(bt_hold),
-                                        exit_on_flip=bt_flip, allow_short=bt_short))
+                                        exit_on_flip=bt_flip, allow_short=bt_short, breakeven_r=bt_be,
+                                        confirm_bars=int(bt_confirm)))
 m = bt_res.metrics
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Сделок", m["trades"], f"лонг {m['longs']} / шорт {m['shorts']}", delta_color="off")
@@ -520,8 +606,11 @@ with left:
     st.subheader("Разбор")
     st.markdown(main.summary)
     if main.trade:
-        st.table({k: [f"{v:,.2f}"] for k, v in {"Вход": main.trade["entry"], "Стоп": main.trade["stop"],
-                                                  "Цель 1": main.trade["target1"], "Цель 2": main.trade["target2"]}.items()})
+        _t = {k: f"{v:,.2f}" for k, v in {"Вход": main.trade["entry"], "Стоп": main.trade["stop"],
+                                            "Цель 1": main.trade["target1"], "Цель 2": main.trade["target2"]}.items()}
+        _t["Прибыль/риск"] = f"{main.trade.get('rr', 0):.1f}" + (" ⚠️" if main.trade.get("rr", 0) < MIN_RR else "")
+        st.table({k: [v] for k, v in _t.items()})
+        st.caption("Стоп ставится за ближайший уровень, если он в 0.75–3 ATR, иначе 1.5 ATR; цели у следующих уровней.")
         _stop_pct = abs(main.trade["entry"] - main.trade["stop"]) / main.trade["entry"] * 100
         _risk, _size = geo.position_size(base_risk, _stop_pct, backdrop.size_mult)
         st.markdown(f"**Размер позиции:** риск {_risk:.2f}% депозита, объём {_size:.0f}% депозита "
@@ -534,9 +623,12 @@ with left:
 with right:
     st.subheader("Голоса индикаторов")
     st.dataframe(
-        [{"Индикатор": v.name, "Голос": "лонг" if v.score > 0.1 else "шорт" if v.score < -0.1 else "нейтр.",
+        [{"Индикатор": v.name, "Семейство": FAMILY_WORD.get(family_of(v), family_of(v)),
+          "Голос": "лонг" if v.score > 0.1 else "шорт" if v.score < -0.1 else "нейтр.",
           "Сила": round(v.score, 2), "Почему": v.reason} for v in main.votes],
         hide_index=True, width="stretch")
+    st.caption("Голоса сначала усредняются внутри семейства, потом семейства между собой, чтобы похожие "
+               "индикаторы не засчитывались несколько раз.")
 
 if errors:
     st.caption("Не загрузились таймфреймы: " + ", ".join(errors))
