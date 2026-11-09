@@ -57,6 +57,7 @@ class NewsItem:
     source: str
     published: datetime
     score: float
+    relevance: float = 1.0  # насколько новость про актив, 0..1 (ставит ИИ; у словаря всегда 1)
 
 
 def asset_key(symbol: str) -> str | None:

@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from den import ai, alerts, geo
+from den import ai, ailog, alerts, geo
 from den import indicators as ind
 from den.analysis import FAMILY_WORD, MIN_RR, analyze, family_of, multi_timeframe
 from den.backtest import BYBIT_TAKER_FEE, BTConfig, describe, simulate, simulate_signal
@@ -105,31 +105,20 @@ with st.sidebar:
             os.environ["DEN_TWELVEDATA_KEY"] = key.strip()
             st.cache_data.clear()
     with st.expander("ИИ-анализ", expanded=not ai.api_key()):
-        _provs = list(ai.PROVIDERS)
-        _cur = ai.provider().name
-        ai_prov = st.selectbox("Провайдер", _provs, index=_provs.index(_cur),
-                               format_func=lambda n: ai.PROVIDERS[n].label,
-                               help="OpenRouter: есть бесплатные модели. Tooken Club: платный посредник, "
-                                    "оплата за токены с баланса. По умолчанию берётся из DEN_AI_PROVIDER.")
-        os.environ["DEN_AI_PROVIDER"] = ai_prov
-        _p = ai.PROVIDERS[ai_prov]
-        if _p.name == "tooken":
-            st.caption("Tooken Club не официальный провайдер моделей. Независимые проверки находили, что "
-                       "часть ответов «Claude» может идти не от оригинальной модели и что токены могут "
-                       "считаться с завышением. Начинайте с небольшого пополнения.")
+        _p = ai.provider()
+        ai_model = ai.model_name(_p)
+        st.caption(f"Модель {ai_model} через {_p.label}. Модель закреплена, чтобы прогнозы в журнале можно "
+                   f"было сравнивать. Если в личном кабинете она называется иначе, задайте имя в {_p.model_env}.")
         if not ai.api_key(_p):
-            or_key = st.text_input(f"Ключ {_p.label}", type="password",
-                                   help=f"{_p.key_help} Чтобы не вводить каждый раз, "
-                                        f"задайте переменную окружения {_p.key_envs[0]}.")
-            if or_key:
-                os.environ[_p.key_envs[0]] = or_key.strip()
-        ai_model = st.text_input("Модель", value=ai.model_name(_p), key=f"ai_model_{_p.name}",
-                                 help="openrouter/free выбирает доступную бесплатную модель. Можно указать "
-                                      "конкретную, например с суффиксом :free, или платную."
-                                 if _p.name == "openrouter" else
-                                 "Точное имя модели из раздела «Модели» в личном кабинете tooken.club. "
-                                 f"Можно задать в {_p.model_env}.")
-        ai_model = ai_model.strip() or None
+            _key = st.text_input(f"Ключ {_p.label}", type="password",
+                                 help=f"{_p.key_help} Чтобы не вводить каждый раз, "
+                                      f"задайте переменную окружения {_p.key_envs[0]}.")
+            if _key:
+                os.environ[_p.key_envs[0]] = _key.strip()
+        if _p.name == "tooken":
+            st.caption("Tooken Club не официальный провайдер моделей, токены могут считаться с завышением. "
+                       f"Один ИИ-анализ = {ai.samples_count()} запроса к модели (итог по медиане), "
+                       "число задаётся в DEN_AI_SAMPLES.")
         ai_news = st.checkbox("Тон новостей через ИИ", value=True, disabled=not ai.api_key(),
                               help="Модель оценивает смысл каждого заголовка вместо словаря фраз. Не больше "
                                    "одного запроса на актив раз в 30 минут, пока открыт дашборд. Без ключа или при ошибке используется словарь.")
@@ -593,11 +582,24 @@ with tab_ai:
     ai_slot = f"ai::{symbol}"
     if st.button("Запросить ИИ-анализ", type="primary", disabled=not ai.api_key(),
                  help=None if ai.api_key() else f"Сначала задайте ключ {ai.provider().label} в боковой панели."):
+        _now = datetime.now(timezone.utc)
+        _base = frames.get(HIT_TF)
+        _last = _base.index[-1].to_pydatetime() if _base is not None and len(_base) else None
+        _price = next(iter(results.values())).price
         ctx = ai.build_context(asset, _contract, results, score, label, verdict=v, ranges=rng, backtests=bts,
-                               news=news, news_sentiment=ns, signal=signal, backdrop=backdrop)
-        with st.spinner("Модель думает, бесплатные модели иногда отвечают до минуты…"):
+                               news=news, news_sentiment=ns, signal=signal, backdrop=backdrop, now=_now,
+                               asset_code=asset_key(symbol), last_bar=_last)
+        with st.spinner(f"Модель думает: {ai.samples_count()} независимых запроса, обычно до пары минут…"):
             try:
-                st.session_state[ai_slot] = (ai.analyze_with_ai(ctx, model=ai_model), datetime.now())
+                _res = ai.analyze_with_ai(ctx, model=ai_model, price=_price, levels=ai.allowed_levels(results, rng),
+                                          atrs=[r.atr for r in results.values()])
+                st.session_state[ai_slot] = (_res, datetime.now())
+                if _res.prob_up is not None:
+                    try:
+                        ailog.append(ailog.make_entry(asset_key(symbol) or symbol, symbol, _price, _res, signal,
+                                                      now=_now, prompt_version=ai.PROMPT_VERSION))
+                    except OSError as e:
+                        st.warning(f"Прогноз не записан в журнал: {e}")
             except ai.AIError as e:
                 st.error(str(e))
     if not ai.api_key():
@@ -606,20 +608,65 @@ with tab_ai:
         res_ai, when = st.session_state[ai_slot]
         a1, a2 = st.columns([1, 2])
         with a1:
-            st.metric("Вывод ИИ", res_ai.direction.capitalize(), f"уверенность: {res_ai.confidence}", delta_color="off")
+            if res_ai.prob_up is not None:
+                st.metric(f"Вероятность роста за {res_ai.horizon_h} ч", f"{res_ai.prob_up:.0f}%",
+                          f"{res_ai.direction}, уверенность {res_ai.confidence}", delta_color="off")
+            else:
+                st.metric("Вывод ИИ", res_ai.direction.capitalize(), f"уверенность: {res_ai.confidence}",
+                          delta_color="off")
+            if len(res_ai.samples) > 1:
+                st.caption("Ответы запросов: " + ", ".join(f"{x:.0f}%" for x in res_ai.samples) + " (итог по медиане)")
+            if res_ai.agree_with_den is not None:
+                st.caption("С сигналом DEN: " + ("согласна" if res_ai.agree_with_den else "не согласна"))
             st.caption(f"Модель: {res_ai.model} · {when:%H:%M}")
         with a2:
             st.markdown(res_ai.summary)
             if res_ai.levels:
                 st.markdown(f"**Уровни:** {res_ai.levels}")
+            if res_ai.issues:
+                st.warning("Ответ прошёл проверку не полностью, относитесь к нему осторожно: "
+                           + "; ".join(res_ai.issues))
         k1, k2 = st.columns(2)
         with k1:
             if res_ai.key_factors:
                 st.markdown("**Ключевые факторы**\n" + "\n".join(f"- {x}" for x in res_ai.key_factors))
         with k2:
             if res_ai.risks:
-                st.markdown("**Риски**\n" + "\n".join(f"- {x}" for x in res_ai.risks))
+                st.markdown("**Что сломает сценарий**\n" + "\n".join(f"- {x}" for x in res_ai.risks))
+            if res_ai.data_gaps:
+                st.markdown("**Не хватило данных**\n" + "\n".join(f"- {x}" for x in res_ai.data_gaps))
         st.caption("Модель видит только данные этого дашборда и может ошибаться. Не является инвестиционной рекомендацией.")
+
+    st.subheader("Журнал прогнозов ИИ")
+    try:
+        _log = ailog.load()
+        if _log and ailog.resolve(_log, frames.get(HIT_TF), symbol):
+            ailog.save_all(_log)
+    except OSError as e:
+        _log = []
+        st.warning(f"Журнал прогнозов не читается: {e}")
+    if not _log:
+        st.caption("Пока пусто. Каждый ИИ-анализ записывается сюда, а когда проходит горизонт прогноза, "
+                   "дашборд сверяет его с ценой. Исходы проставляются при открытом дашборде по свечам актива.")
+    else:
+        _s = ailog.stats([e for e in _log if e.get("symbol") == symbol])
+        j1, j2, j3, j4 = st.columns(4)
+        j1.metric("Прогнозов с исходом", _s["n"], f"ждут исхода: {_s['pending']}", delta_color="off")
+        if _s.get("ai_n"):
+            j2.metric("ИИ угадал направление", f"{_s['ai_hit']:.0%}", f"из {_s['ai_n']}", delta_color="off")
+        if _s.get("den_n"):
+            j3.metric("DEN угадал направление", f"{_s['den_hit']:.0%}", f"из {_s['den_n']}", delta_color="off")
+        if "brier_ai" in _s:
+            j4.metric("Brier ИИ (меньше лучше)", f"{_s['brier_ai']:.3f}",
+                      f"база {_s['brier_base']:.3f}", delta_color="off")
+        st.caption("Brier score: средний квадрат ошибки вероятности. «База» — прогноз, который всегда называет "
+                   "среднюю частоту роста; если ИИ не лучше базы, его вероятность ничего не добавляет. "
+                   "Выводы имеют смысл после 50–100 прогнозов с исходом.")
+        with st.expander("По версиям промпта, моделям и активам"):
+            for _by, _t in (("prompt", "Версия промпта"), ("model", "Модель"), ("asset", "Актив")):
+                st.markdown(f"**{_t}**")
+                st.dataframe(ailog.stats_table(_log, _by), hide_index=True, width="stretch")
+            st.caption(f"Файл журнала: {ailog.log_path()}")
 
 with tab_more:
     st.subheader("Консенсус по таймфреймам")
